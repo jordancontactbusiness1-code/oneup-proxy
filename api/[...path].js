@@ -12,16 +12,24 @@ const ALLOWED = [
 module.exports = async function handler(req, res) {
   var origin = req.headers.origin || '';
   var ok = ALLOWED.some(function(o) { return origin.startsWith(o); });
-  res.setHeader('Access-Control-Allow-Origin', ok ? origin : '');
+  res.setHeader('Access-Control-Allow-Origin', ok ? origin : '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
-  res.setHeader('Access-Control-Allow-Credentials', 'false');
 
   if (req.method === 'OPTIONS') { res.status(200).end(); return; }
 
-  // Build OneUp path from Vercel's path params
-  var pathParts = req.query.path || [];
-  var apiPath   = '/api/' + (Array.isArray(pathParts) ? pathParts.join('/') : pathParts);
+  // Extract path from URL: /api/listcategory → /api/listcategory on OneUp
+  var rawUrl   = req.url || '';
+  var urlPath  = rawUrl.split('?')[0]; // e.g. /api/listcategory
+  // Remove the Vercel function prefix if present (Vercel may strip it already)
+  var apiPath  = urlPath.startsWith('/api/') ? urlPath : '/api/' + urlPath.replace(/^\/+/, '');
+  // Fallback: use query param path if URL path is just /api
+  if (apiPath === '/api/' || apiPath === '/api') {
+    var qPath = req.query.path;
+    if (qPath) {
+      apiPath = '/api/' + (Array.isArray(qPath) ? qPath.join('/') : qPath);
+    }
+  }
 
   try {
     if (req.method === 'GET') {
@@ -31,13 +39,12 @@ module.exports = async function handler(req, res) {
         if (k !== 'path') params.set(k, req.query[k]);
       });
       var r    = await fetch(ONEUP_BASE + apiPath + '?' + params.toString());
-      var data = await r.json();
-      res.json(data);
+      var text = await r.text();
+      try { res.json(JSON.parse(text)); } catch(e) { res.status(502).json({ error: 'OneUp returned non-JSON', body: text.slice(0, 200) }); }
 
     } else if (req.method === 'POST') {
       var body = new URLSearchParams();
       body.set('apiKey', ONEUP_KEY);
-      // req.body is already parsed by Vercel for application/x-www-form-urlencoded
       var payload = req.body || {};
       Object.keys(payload).forEach(function(k) { body.set(k, payload[k]); });
       var r    = await fetch(ONEUP_BASE + apiPath, {
@@ -45,8 +52,8 @@ module.exports = async function handler(req, res) {
         body:    body,
         headers: { 'Content-Type': 'application/x-www-form-urlencoded' }
       });
-      var data = await r.json();
-      res.json(data);
+      var text = await r.text();
+      try { res.json(JSON.parse(text)); } catch(e) { res.status(502).json({ error: 'OneUp returned non-JSON', body: text.slice(0, 200) }); }
     } else {
       res.status(405).json({ error: 'Method not allowed' });
     }
