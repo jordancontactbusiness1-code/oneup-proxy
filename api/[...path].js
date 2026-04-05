@@ -1,7 +1,8 @@
 const fetch = require('node-fetch');
 
-const ONEUP_KEY  = process.env.ONEUP_API_KEY || '';
-const ONEUP_BASE = 'https://www.oneupapp.io';
+const ONEUP_KEY      = process.env.ONEUP_API_KEY || '';
+const ONEUP_BASE     = 'https://www.oneupapp.io';
+const ASSEMBLYAI_KEY = process.env.ASSEMBLYAI_API_KEY || '';
 
 const ALLOWED = [
   'https://ofm-dashboard.onrender.com',
@@ -28,6 +29,42 @@ module.exports = async function handler(req, res) {
     var qPath = req.query.path;
     if (qPath) {
       apiPath = '/api/' + (Array.isArray(qPath) ? qPath.join('/') : qPath);
+    }
+  }
+
+  // ── Route spéciale : /api/transcribe → AssemblyAI (pas OneUp) ──────
+  if (apiPath === '/api/transcribe') {
+    if (req.method !== 'POST') { res.status(405).json({ error: true, message: 'Method not allowed' }); return; }
+    if (!ASSEMBLYAI_KEY) { res.status(500).json({ error: true, message: 'ASSEMBLYAI_API_KEY not configured' }); return; }
+    try {
+      var payload = req.body || {};
+      var action  = payload.action || 'submit';
+      if (action === 'submit') {
+        if (!payload.audio_url) { res.status(400).json({ error: true, message: 'audio_url required' }); return; }
+        var submitRes = await fetch('https://api.assemblyai.com/v2/transcript', {
+          method: 'POST',
+          headers: { 'Authorization': ASSEMBLYAI_KEY, 'Content-Type': 'application/json' },
+          body: JSON.stringify({ audio_url: payload.audio_url, language_detection: true })
+        });
+        var submitData = await submitRes.json();
+        res.status(200).json(submitData);
+        return;
+      } else if (action === 'poll') {
+        if (!payload.transcript_id) { res.status(400).json({ error: true, message: 'transcript_id required' }); return; }
+        var pollRes = await fetch('https://api.assemblyai.com/v2/transcript/' + payload.transcript_id, {
+          method: 'GET',
+          headers: { 'Authorization': ASSEMBLYAI_KEY }
+        });
+        var pollData = await pollRes.json();
+        res.status(200).json(pollData);
+        return;
+      } else {
+        res.status(400).json({ error: true, message: 'Invalid action (submit|poll)' });
+        return;
+      }
+    } catch (e) {
+      res.status(500).json({ error: true, message: 'AssemblyAI error: ' + e.message });
+      return;
     }
   }
 
