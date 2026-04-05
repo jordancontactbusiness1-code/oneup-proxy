@@ -44,7 +44,11 @@ module.exports = async function handler(req, res) {
         var submitRes = await fetch('https://api.assemblyai.com/v2/transcript', {
           method: 'POST',
           headers: { 'Authorization': ASSEMBLYAI_KEY, 'Content-Type': 'application/json' },
-          body: JSON.stringify({ audio_url: payload.audio_url, language_detection: true })
+          body: JSON.stringify({
+            audio_url: payload.audio_url,
+            language_detection: true,
+            speech_models: ['universal-2']  // API 2026 : field renommé en array
+          })
         });
         var submitData = await submitRes.json();
         res.status(200).json(submitData);
