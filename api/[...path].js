@@ -4,6 +4,11 @@ const ONEUP_KEY      = process.env.ONEUP_API_KEY || '';
 const ONEUP_BASE     = 'https://www.oneupapp.io';
 const ASSEMBLYAI_KEY = process.env.ASSEMBLYAI_API_KEY || '';
 
+// Google Drive OAuth2 credentials (pour move fichiers reels/ → posted/)
+const GDRIVE_CLIENT_ID     = process.env.GDRIVE_CLIENT_ID || '';
+const GDRIVE_CLIENT_SECRET = process.env.GDRIVE_CLIENT_SECRET || '';
+const GDRIVE_REFRESH_TOKEN = process.env.GDRIVE_REFRESH_TOKEN || '';
+
 const ALLOWED = [
   'https://ofm-dashboard.onrender.com',
   'http://localhost',
@@ -29,6 +34,57 @@ module.exports = async function handler(req, res) {
     var qPath = req.query.path;
     if (qPath) {
       apiPath = '/api/' + (Array.isArray(qPath) ? qPath.join('/') : qPath);
+    }
+  }
+
+  // ── Route spéciale : /api/drive-move → Déplace un fichier Drive vers posted/ ──
+  // Body: { fileId, fromFolderId, toFolderId }
+  // Utilise OAuth2 refresh token de zentyagency@gmail.com
+  if (apiPath === '/api/drive-move') {
+    if (req.method !== 'POST') { res.status(405).json({ error: true, message: 'POST only' }); return; }
+    if (!GDRIVE_CLIENT_ID || !GDRIVE_REFRESH_TOKEN) {
+      res.status(500).json({ error: true, message: 'GDRIVE credentials not configured on Vercel' }); return;
+    }
+    try {
+      var payload = req.body || {};
+      var fileId = payload.fileId;
+      var fromFolderId = payload.fromFolderId;
+      var toFolderId = payload.toFolderId;
+      if (!fileId || !fromFolderId || !toFolderId) {
+        res.status(400).json({ error: true, message: 'fileId, fromFolderId, toFolderId required' }); return;
+      }
+
+      // Get fresh access token from refresh token
+      var tokenBody = new URLSearchParams({
+        client_id: GDRIVE_CLIENT_ID,
+        client_secret: GDRIVE_CLIENT_SECRET,
+        refresh_token: GDRIVE_REFRESH_TOKEN,
+        grant_type: 'refresh_token'
+      }).toString();
+      var tokenRes = await fetch('https://oauth2.googleapis.com/token', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: tokenBody
+      });
+      var tokenData = await tokenRes.json();
+      if (!tokenData.access_token) {
+        res.status(500).json({ error: true, message: 'OAuth token refresh failed', detail: tokenData }); return;
+      }
+
+      // Move file: remove from old parent, add to new parent
+      var moveRes = await fetch('https://www.googleapis.com/drive/v3/files/' + fileId + '?addParents=' + toFolderId + '&removeParents=' + fromFolderId, {
+        method: 'PATCH',
+        headers: { 'Authorization': 'Bearer ' + tokenData.access_token, 'Content-Type': 'application/json' },
+        body: JSON.stringify({})
+      });
+      var moveData = await moveRes.json();
+      if (moveData.error) {
+        res.status(moveRes.status || 500).json({ error: true, message: moveData.error.message || 'Move failed' }); return;
+      }
+      res.status(200).json({ ok: true, fileId: fileId, newParents: moveData.parents });
+      return;
+    } catch (e) {
+      res.status(500).json({ error: true, message: 'Drive move error: ' + e.message }); return;
     }
   }
 
