@@ -62,23 +62,17 @@ async function getAllAccounts() {
   });
 }
 
-// accountNumbers = { "1": "acc_id_xxx", "2": "acc_id_yyy", ... }
-// Synced by dashboard renderTable()
-async function getNumberMap() {
-  var data = await fbGet('zenty/accountNumbers');
-  return data || {};
+// Numérotation calculée par le bot (pas de dépendance au dashboard)
+// Les comptes non-spare sont numérotés dans l'ordre de Firebase
+function numberAccounts(accounts) {
+  var nonSpare = accounts.filter(function(a) { return a.status !== 'spare'; });
+  nonSpare.forEach(function(a, i) { a._num = i + 1; });
+  return nonSpare;
 }
 
-async function findByNumber(num) {
-  var map = await getNumberMap();
-  var accId = map[String(num)];
-  if (!accId) return null;
-  var acc = await fbGet('zenty/accounts/' + accId);
-  if (!acc) return null;
-  acc._fbId = accId;
-  // Find the number
-  acc._num = num;
-  return acc;
+function findByNumber(accounts, num) {
+  var numbered = numberAccounts(accounts);
+  return numbered.filter(function(a) { return a._num === num; })[0] || null;
 }
 
 function findSpare(accounts) {
@@ -97,11 +91,11 @@ async function cmdBan(chatId, args) {
 
   if (!num || num < 1) return sendTG(chatId, '❌ Numéro invalide. Tape `/status` pour voir les numéros.');
 
-  var acc = await findByNumber(num);
+  var accounts = await getAllAccounts();
+  var acc = findByNumber(accounts, num);
   if (!acc) return sendTG(chatId, '❌ Compte #' + num + ' introuvable. Tape `/status` pour voir la liste.');
 
   var handle = clean(acc.handle);
-  var accounts = await getAllAccounts();
   var spare = findSpare(accounts);
 
   if (!spare) {
@@ -158,7 +152,8 @@ async function cmdProblem(chatId, args) {
 
   if (!num || num < 1) return sendTG(chatId, '❌ Numéro invalide. Tape `/status` pour voir les numéros.');
 
-  var acc = await findByNumber(num);
+  var accounts = await getAllAccounts();
+  var acc = findByNumber(accounts, num);
   if (!acc) return sendTG(chatId, '❌ Compte #' + num + ' introuvable.');
 
   var handle = clean(acc.handle);
@@ -177,11 +172,8 @@ async function cmdProblem(chatId, args) {
 
 async function cmdStatus(chatId) {
   var accounts = await getAllAccounts();
-  var numMap = await getNumberMap();
-
-  // Inverser la map : accId → num
-  var idToNum = {};
-  Object.keys(numMap).forEach(function(n) { idToNum[numMap[n]] = n; });
+  // Numéroter les comptes non-spare (même logique que le dashboard)
+  numberAccounts(accounts);
 
   var warmup = accounts.filter(function(a) { return a.status === 'warmup'; });
   var spares = accounts.filter(function(a) { return a.status === 'spare'; });
@@ -193,18 +185,16 @@ async function cmdStatus(chatId) {
   if (warmup.length) {
     lines.push('🟡 *Warm-up (' + warmup.length + ')* :');
     warmup.forEach(function(a) {
-      var num = idToNum[a._fbId] || '?';
       var day = a.warmupStartedAt ? Math.floor((Date.now() - a.warmupStartedAt) / 86400000) + 1 : '?';
       var issue = a.lastIssue ? ' ⚠️' : '';
-      lines.push('  #' + num + ' @' + clean(a.handle) + ' — D' + day + ' — VA: ' + (a.va || '-') + issue);
+      lines.push('  #' + (a._num || '?') + ' @' + clean(a.handle) + ' — D' + day + ' — VA: ' + (a.va || '-') + issue);
     });
   }
 
   if (automated.length) {
     lines.push('\n🟢 *Actifs (' + automated.length + ')* :');
     automated.forEach(function(a) {
-      var num = idToNum[a._fbId] || '?';
-      lines.push('  #' + num + ' @' + clean(a.handle));
+      lines.push('  #' + (a._num || '?') + ' @' + clean(a.handle));
     });
   }
 
