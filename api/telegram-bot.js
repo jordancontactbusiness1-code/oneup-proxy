@@ -114,11 +114,12 @@ async function cmdBan(chatId, args) {
   // Sauvegarder les anciennes credentials pour le log
   var oldLogin = acc.originalUsername || acc.handle || '?';
 
-  // Swap credentials : prendre ceux du spare → les mettre sur le compte #N
+  // Swap credentials + reset warm-up à D1 (nouveau compte = nouveau warm-up)
   await fbPatch('zenty/accounts/' + acc._fbId, {
     originalUsername: spare.originalUsername || spare.handle || '',
     password: spare.password || '',
     secret2fa: spare.secret2fa || '',
+    warmupStartedAt: Date.now(),
     bannedCredentials: oldLogin + ' (' + reason + ', ' + new Date().toISOString().substring(0, 10) + ')',
     notes: ((acc.notes || '') + '\n[' + new Date().toISOString().substring(0, 10) + '] Credentials swapped: ' + oldLogin + ' -> ' + clean(spare.handle) + ' (' + reason + ')').trim()
   });
