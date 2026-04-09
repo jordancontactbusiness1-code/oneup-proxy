@@ -107,15 +107,30 @@ async function cmdBan(chatId, args) {
 
   // Sauvegarder les anciennes credentials pour le log
   var oldLogin = acc.originalUsername || acc.handle || '?';
+  var spareLogin = spare.originalUsername || spare.handle || '?';
 
-  // Swap credentials + reset warm-up à D1 (nouveau compte = nouveau warm-up)
+  // Swap COMPLET : credentials + reset stats (nouveau compte = table rase)
+  // Seuls VA, position (#N), modelName sont conservés
   await fbPatch('zenty/accounts/' + acc._fbId, {
-    originalUsername: spare.originalUsername || spare.handle || '',
+    // Credentials du spare (remplacement complet — zero reste de l'ancien)
+    handle: spareLogin,
+    originalUsername: spareLogin,
     password: spare.password || '',
     secret2fa: spare.secret2fa || '',
+    // Reset warm-up a D1
     warmupStartedAt: Date.now(),
+    status: 'warmup',
+    // Reset stats (nouveau compte vierge)
+    bio: '',
+    followers: 0,
+    posts: 0,
+    following: 0,
+    lastPostDate: '',
+    lastIssue: null,
+    lastIssueAt: null,
+    // Log du remplacement
     bannedCredentials: oldLogin + ' (' + reason + ', ' + new Date().toISOString().substring(0, 10) + ')',
-    notes: ((acc.notes || '') + '\n[' + new Date().toISOString().substring(0, 10) + '] Credentials swapped: ' + oldLogin + ' -> ' + clean(spare.handle) + ' (' + reason + ')').trim()
+    notes: '[' + new Date().toISOString().substring(0, 10) + '] Remplace ' + oldLogin + ' -> ' + spareLogin + ' (' + reason + ')'
   });
 
   // Supprimer le spare de la banque (usage unique)
@@ -125,13 +140,14 @@ async function cmdBan(chatId, args) {
     return a.status === 'spare' && a._fbId !== spare._fbId;
   }).length;
 
-  var spareLogin = spare.originalUsername || spare.handle || '?';
-
   await sendTG(chatId,
-    '✅ *Compte #' + num + ' — credentials remplacés*\n\n' +
-    '❌ Ancien login : `' + oldLogin + '` (' + reason + ')\n' +
-    '🔑 Nouveau login : `' + spareLogin + '`\n' +
-    '👤 VA : ' + (acc.va || '-') + ' — continue le warm-up normalement\n' +
+    '✅ *Compte #' + num + ' — remplacé*\n\n' +
+    '❌ Ancien : `' + oldLogin + '` (' + reason + ')\n\n' +
+    '🔑 *Nouveaux credentials :*\n' +
+    '  Login : `' + spareLogin + '`\n' +
+    '  Password : `' + (spare.password || '-') + '`\n' +
+    '  2FA : `' + (spare.secret2fa || '-') + '`\n\n' +
+    '👤 VA : ' + (acc.va || '-') + ' — warm-up D1\n' +
     '📦 Spares restants : ' + remainingSpares);
 
   await notifyJordan(
