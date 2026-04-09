@@ -25,6 +25,7 @@ const TG_TOKEN    = process.env.TG_WARMUP_BOT_TOKEN || '';
 const DEPLOY_BOT_TOKEN = process.env.TG_TOKEN || '8731205281:AAEDHGji6_Oe3Cue30LBZ6x_8-CTN2F9DcQ';
 const JORDAN_CHAT = process.env.TG_JORDAN_CHAT || '6646462254';
 const FIREBASE_URL = process.env.FIREBASE_URL || 'https://dashboard-a76d2-default-rtdb.firebaseio.com';
+const FIREBASE_SECRET = process.env.FIREBASE_SECRET || '';
 
 // ── Helpers ──────────────────────────────────────────────────────
 
@@ -47,13 +48,17 @@ async function notifyJordan(text) {
   }).catch(function() {});
 }
 
+function fbUrl(path) {
+  return FIREBASE_URL + '/' + path + '.json?auth=' + FIREBASE_SECRET;
+}
+
 async function fbGet(path) {
-  var r = await fetch(FIREBASE_URL + '/' + path + '.json');
+  var r = await fetch(fbUrl(path));
   return r.json();
 }
 
 async function fbSet(path, data) {
-  await fetch(FIREBASE_URL + '/' + path + '.json', {
+  await fetch(fbUrl(path), {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(data)
@@ -61,7 +66,7 @@ async function fbSet(path, data) {
 }
 
 async function fbPatch(path, data) {
-  await fetch(FIREBASE_URL + '/' + path + '.json', {
+  await fetch(fbUrl(path), {
     method: 'PATCH',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(data)
@@ -87,8 +92,21 @@ async function getAllAccounts() {
 function findAccount(accounts, handle) {
   var h = clean(handle);
   return accounts.filter(function(a) {
+    // Handle peut être "@tina.dolcezza" ou "tina.dolcezza" dans Firebase
     return clean(a.handle) === h;
   })[0] || null;
+}
+
+// Cherche aussi par sous-chaîne (le VA peut taper "tinabellezzay" au lieu du handle exact)
+function findAccountFuzzy(accounts, input) {
+  var exact = findAccount(accounts, input);
+  if (exact) return exact;
+  var h = clean(input);
+  var matches = accounts.filter(function(a) {
+    var ah = clean(a.handle);
+    return ah.indexOf(h) !== -1 || h.indexOf(ah) !== -1;
+  });
+  return matches.length === 1 ? matches[0] : null;
 }
 
 function findSpare(accounts) {
@@ -106,8 +124,9 @@ async function cmdBan(chatId, args) {
   if (!handle) return sendTG(chatId, '❌ Handle manquant');
 
   var accounts = await getAllAccounts();
-  var acc = findAccount(accounts, handle);
+  var acc = findAccountFuzzy(accounts, handle);
   if (!acc) return sendTG(chatId, '❌ Compte @' + handle + ' introuvable dans le dashboard');
+  handle = clean(acc.handle); // Utiliser le vrai handle trouvé
   if (acc.status === 'banned') return sendTG(chatId, '⚠️ @' + handle + ' est déjà marqué comme banni');
 
   // Sauvegarder les infos warm-up du compte banni
@@ -169,8 +188,9 @@ async function cmdProblem(chatId, args) {
   if (!handle) return sendTG(chatId, '❌ Handle manquant');
 
   var accounts = await getAllAccounts();
-  var acc = findAccount(accounts, handle);
+  var acc = findAccountFuzzy(accounts, handle);
   if (!acc) return sendTG(chatId, '❌ Compte @' + handle + ' introuvable');
+  handle = clean(acc.handle);
 
   // Ajouter une note au compte sans changer le statut
   var notes = (acc.notes || '') + '\n[' + new Date().toISOString().substring(0, 10) + '] ' + reason;
@@ -192,11 +212,13 @@ async function cmdReplace(chatId, args) {
   var newHandle = clean(args[1]);
 
   var accounts = await getAllAccounts();
-  var oldAcc = findAccount(accounts, oldHandle);
-  var newAcc = findAccount(accounts, newHandle);
+  var oldAcc = findAccountFuzzy(accounts, oldHandle);
+  var newAcc = findAccountFuzzy(accounts, newHandle);
 
   if (!oldAcc) return sendTG(chatId, '❌ @' + oldHandle + ' introuvable');
   if (!newAcc) return sendTG(chatId, '❌ @' + newHandle + ' introuvable');
+  oldHandle = clean(oldAcc.handle);
+  newHandle = clean(newAcc.handle);
   if (newAcc.status !== 'spare') return sendTG(chatId, '⚠️ @' + newHandle + ' n\'est pas un spare (statut: ' + newAcc.status + ')');
 
   var oldVa = oldAcc.va || 'non-assigné';
