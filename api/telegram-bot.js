@@ -1,7 +1,8 @@
 // ═══════════════════════════════════════════════════════════════════
-//  ZENTY — TELEGRAM BOT (Vercel Serverless)
+//  ZENTY — BOT WARM-UP (Vercel Serverless)
 //  Webhook endpoint : /api/telegram-bot
-//  Le VA communique les problèmes warm-up via commandes Telegram
+//  Bot DÉDIÉ warm-up — séparé du bot deploy/alertes (@OFM_Deploy_Bot)
+//  Le VA (et Jordan) communiquent les problèmes warm-up ici
 //  Le bot met à jour Firebase directement (source de vérité dashboard)
 //
 //  Commandes :
@@ -10,21 +11,39 @@
 //    /replace @old @new       → swap manuel de deux comptes
 //    /status                  → état warm-up de tous les comptes
 //    /help                    → liste des commandes
+//
+//  BOTS TELEGRAM ZENTY :
+//    @OFM_Deploy_Bot   → alertes système, audit, deploy (TG_TOKEN dans daily-trigger)
+//    @zenty_warmup_bot → commandes VA warm-up (TG_WARMUP_BOT_TOKEN ici)
 // ═══════════════════════════════════════════════════════════════════
 
 const fetch = require('node-fetch');
 
-const TG_TOKEN    = process.env.TG_BOT_TOKEN || '8731205281:AAEDHGji6_Oe3Cue30LBZ6x_8-CTN2F9DcQ';
+// Token du bot WARM-UP (pas le même que le bot deploy)
+const TG_TOKEN    = process.env.TG_WARMUP_BOT_TOKEN || '';
+// Notifications Jordan via le bot DEPLOY (alertes système séparées)
+const DEPLOY_BOT_TOKEN = process.env.TG_TOKEN || '8731205281:AAEDHGji6_Oe3Cue30LBZ6x_8-CTN2F9DcQ';
 const JORDAN_CHAT = process.env.TG_JORDAN_CHAT || '6646462254';
 const FIREBASE_URL = process.env.FIREBASE_URL || 'https://dashboard-a76d2-default-rtdb.firebaseio.com';
 
 // ── Helpers ──────────────────────────────────────────────────────
 
+// Répondre au VA (ou Jordan) via le bot warm-up
 async function sendTG(chatId, text) {
+  if (!TG_TOKEN) { console.error('[WarmupBot] TG_WARMUP_BOT_TOKEN non configuré'); return; }
   await fetch('https://api.telegram.org/bot' + TG_TOKEN + '/sendMessage', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ chat_id: chatId, text: text, parse_mode: 'Markdown' })
+  }).catch(function() {});
+}
+
+// Notifier Jordan via le bot deploy (canal séparé)
+async function notifyJordan(text) {
+  await fetch('https://api.telegram.org/bot' + DEPLOY_BOT_TOKEN + '/sendMessage', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ chat_id: JORDAN_CHAT, text: text, parse_mode: 'Markdown' })
   }).catch(function() {});
 }
 
@@ -110,7 +129,7 @@ async function cmdBan(chatId, args) {
   var spare = findSpare(accounts);
   if (!spare) {
     await sendTG(chatId, '⚠️ @' + handle + ' marqué *banni* mais *AUCUN spare disponible* !\nAjouter des comptes spare dans le dashboard.');
-    await sendTG(JORDAN_CHAT, '🚨 *ALERTE WARM-UP*\n\n@' + handle + ' banni (' + reason + ')\n⚠️ *Pool spare VIDE* — pas de remplacement\nVA : ' + oldVa + ' (était à D' + oldDay + ')');
+    await notifyJordan( '🚨 *ALERTE WARM-UP*\n\n@' + handle + ' banni (' + reason + ')\n⚠️ *Pool spare VIDE* — pas de remplacement\nVA : ' + oldVa + ' (était à D' + oldDay + ')');
     return;
   }
 
@@ -135,7 +154,7 @@ async function cmdBan(chatId, args) {
     '📦 Spares restants : ' + remainingSpares);
 
   // Notifier Jordan
-  await sendTG(JORDAN_CHAT, '🔄 *ROTATION WARM-UP*\n\n' +
+  await notifyJordan( '🔄 *ROTATION WARM-UP*\n\n' +
     '❌ @' + handle + ' banni (' + reason + ')\n' +
     '✅ Remplacé par @' + spareHandle + ' → D1\n' +
     'VA : ' + oldVa + ' (était à D' + oldDay + ')\n' +
@@ -164,7 +183,7 @@ async function cmdProblem(chatId, args) {
   await sendTG(chatId, '📝 Problème noté pour @' + handle + ' : ' + reason);
 
   // Notifier Jordan
-  await sendTG(JORDAN_CHAT, '⚠️ *PROBLÈME WARM-UP*\n\n@' + handle + ' : ' + reason + '\nStatut : ' + (acc.status || '?') + '\nVA : ' + (acc.va || '?'));
+  await notifyJordan( '⚠️ *PROBLÈME WARM-UP*\n\n@' + handle + ' : ' + reason + '\nStatut : ' + (acc.status || '?') + '\nVA : ' + (acc.va || '?'));
 }
 
 async function cmdReplace(chatId, args) {
@@ -199,7 +218,7 @@ async function cmdReplace(chatId, args) {
   });
 
   await sendTG(chatId, '✅ @' + oldHandle + ' → banni\n✅ @' + newHandle + ' → warm-up D1, VA: ' + oldVa);
-  await sendTG(JORDAN_CHAT, '🔄 *SWAP MANUEL*\n@' + oldHandle + ' → @' + newHandle + '\nVA : ' + oldVa);
+  await notifyJordan( '🔄 *SWAP MANUEL*\n@' + oldHandle + ' → @' + newHandle + '\nVA : ' + oldVa);
 }
 
 async function cmdStatus(chatId) {
@@ -260,6 +279,10 @@ function cmdHelp(chatId) {
 // ── Webhook Handler ─────────────────────────────────────────────
 
 module.exports = async function handler(req, res) {
+  if (!TG_TOKEN) {
+    res.status(200).json({ ok: false, message: 'TG_WARMUP_BOT_TOKEN not configured in Vercel env vars' });
+    return;
+  }
   if (req.method !== 'POST') {
     res.status(200).json({ ok: true, message: 'Zenty Warm-up Bot active' });
     return;
