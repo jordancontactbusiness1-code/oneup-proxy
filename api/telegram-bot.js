@@ -2,34 +2,32 @@
 //  ZENTY — BOT WARM-UP (Vercel Serverless)
 //  Webhook endpoint : /api/telegram-bot
 //  Bot DÉDIÉ warm-up — séparé du bot deploy/alertes (@OFM_Deploy_Bot)
-//  Le VA (et Jordan) communiquent les problèmes warm-up ici
-//  Le bot met à jour Firebase directement (source de vérité dashboard)
+//
+//  Le VA tape le NUMÉRO du compte (#1, #2...) affiché dans le dashboard.
+//  /ban remplace les credentials par un spare (le compte garde sa position,
+//  son VA, sa progression warm-up — seuls login/pwd/2fa changent).
 //
 //  Commandes :
-//    /ban @handle raison      → marque banned + pioche un spare + notifie Jordan
-//    /problem @handle raison  → signale un problème (shadow, restrict...)
-//    /replace @old @new       → swap manuel de deux comptes
-//    /status                  → état warm-up de tous les comptes
-//    /help                    → liste des commandes
+//    /ban N raison       → swap credentials du compte #N avec un spare
+//    /problem N raison   → signale un problème sur le compte #N
+//    /status             → état warm-up avec numéros
+//    /help               → liste des commandes
 //
 //  BOTS TELEGRAM ZENTY :
-//    @OFM_Deploy_Bot   → alertes système, audit, deploy (TG_TOKEN dans daily-trigger)
-//    @zenty_warmup_bot → commandes VA warm-up (TG_WARMUP_BOT_TOKEN ici)
+//    @OFM_Deploy_Bot     → alertes système, audit, deploy
+//    @Zenty_Warmupbot    → commandes VA warm-up (ce fichier)
 // ═══════════════════════════════════════════════════════════════════
 
 const fetch = require('node-fetch');
 
-// Token du bot WARM-UP (pas le même que le bot deploy)
-const TG_TOKEN    = process.env.TG_WARMUP_BOT_TOKEN || '';
-// Notifications Jordan via le bot DEPLOY (alertes système séparées)
+const TG_TOKEN         = process.env.TG_WARMUP_BOT_TOKEN || '';
 const DEPLOY_BOT_TOKEN = process.env.TG_TOKEN || '8731205281:AAEDHGji6_Oe3Cue30LBZ6x_8-CTN2F9DcQ';
-const JORDAN_CHAT = process.env.TG_JORDAN_CHAT || '6646462254';
-const FIREBASE_URL = process.env.FIREBASE_URL || 'https://dashboard-a76d2-default-rtdb.firebaseio.com';
-const FIREBASE_SECRET = process.env.FIREBASE_SECRET || '';
+const JORDAN_CHAT      = process.env.TG_JORDAN_CHAT || '6646462254';
+const FIREBASE_URL     = process.env.FIREBASE_URL || 'https://dashboard-a76d2-default-rtdb.firebaseio.com';
+const FIREBASE_SECRET  = process.env.FIREBASE_SECRET || '';
 
 // ── Helpers ──────────────────────────────────────────────────────
 
-// Répondre au VA (ou Jordan) via le bot warm-up
 async function sendTG(chatId, text) {
   if (!TG_TOKEN) { console.error('[WarmupBot] TG_WARMUP_BOT_TOKEN non configuré'); return; }
   await fetch('https://api.telegram.org/bot' + TG_TOKEN + '/sendMessage', {
@@ -39,7 +37,6 @@ async function sendTG(chatId, text) {
   }).catch(function() {});
 }
 
-// Notifier Jordan via le bot deploy (canal séparé)
 async function notifyJordan(text) {
   await fetch('https://api.telegram.org/bot' + DEPLOY_BOT_TOKEN + '/sendMessage', {
     method: 'POST',
@@ -48,203 +45,143 @@ async function notifyJordan(text) {
   }).catch(function() {});
 }
 
-function fbUrl(path) {
-  return FIREBASE_URL + '/' + path + '.json?auth=' + FIREBASE_SECRET;
-}
+function fbPath(p) { return FIREBASE_URL + '/' + p + '.json?auth=' + FIREBASE_SECRET; }
+async function fbGet(p) { var r = await fetch(fbPath(p)); return r.json(); }
+async function fbPatch(p, d) { await fetch(fbPath(p), { method: 'PATCH', headers: {'Content-Type':'application/json'}, body: JSON.stringify(d) }); }
+async function fbDelete(p) { await fetch(fbPath(p), { method: 'DELETE' }); }
 
-async function fbGet(path) {
-  var r = await fetch(fbUrl(path));
-  return r.json();
-}
+function clean(h) { return (h || '').replace(/^@/, '').toLowerCase().trim(); }
 
-async function fbSet(path, data) {
-  await fetch(fbUrl(path), {
-    method: 'PUT',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(data)
-  });
-}
-
-async function fbPatch(path, data) {
-  await fetch(fbUrl(path), {
-    method: 'PATCH',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(data)
-  });
-}
-
-function clean(handle) {
-  return (handle || '').replace(/^@/, '').toLowerCase().trim();
-}
-
-// ── Load all accounts from Firebase ─────────────────────────────
+// ── Load accounts + number map from Firebase ────────────────────
 
 async function getAllAccounts() {
   var data = await fbGet('zenty/accounts');
   if (!data) return [];
   return Object.keys(data).map(function(id) {
-    var a = data[id];
-    a._fbId = id;
-    return a;
+    var a = data[id]; a._fbId = id; return a;
   });
 }
 
-function findAccount(accounts, handle) {
-  var h = clean(handle);
-  return accounts.filter(function(a) {
-    // Handle peut être "@tina.dolcezza" ou "tina.dolcezza" dans Firebase
-    return clean(a.handle) === h;
-  })[0] || null;
+// accountNumbers = { "1": "acc_id_xxx", "2": "acc_id_yyy", ... }
+// Synced by dashboard renderTable()
+async function getNumberMap() {
+  var data = await fbGet('zenty/accountNumbers');
+  return data || {};
 }
 
-// Cherche aussi par sous-chaîne (le VA peut taper "tinabellezzay" au lieu du handle exact)
-function findAccountFuzzy(accounts, input) {
-  var exact = findAccount(accounts, input);
-  if (exact) return exact;
-  var h = clean(input);
-  var matches = accounts.filter(function(a) {
-    var ah = clean(a.handle);
-    return ah.indexOf(h) !== -1 || h.indexOf(ah) !== -1;
-  });
-  return matches.length === 1 ? matches[0] : null;
+async function findByNumber(num) {
+  var map = await getNumberMap();
+  var accId = map[String(num)];
+  if (!accId) return null;
+  var acc = await fbGet('zenty/accounts/' + accId);
+  if (!acc) return null;
+  acc._fbId = accId;
+  // Find the number
+  acc._num = num;
+  return acc;
 }
 
 function findSpare(accounts) {
-  return accounts.filter(function(a) {
-    return a.status === 'spare';
-  })[0] || null;
+  return accounts.filter(function(a) { return a.status === 'spare'; })[0] || null;
 }
 
-// ── Commands ────────────────────────────────────────────────────
+// ── /ban N raison — Credential swap ─────────────────────────────
+// Le compte #N GARDE sa position, VA, warm-up day.
+// Seuls login/password/2fa sont remplacés par ceux du spare.
+// Le spare est SUPPRIMÉ de la banque (usage unique).
 
 async function cmdBan(chatId, args) {
-  if (!args.length) return sendTG(chatId, '❌ Usage : `/ban @handle raison`');
-  var handle = clean(args[0]);
+  if (!args.length) return sendTG(chatId, '❌ Usage : `/ban N raison`\nExemple : `/ban 3 shadow ban`');
+  var num = parseInt(args[0], 10);
   var reason = args.slice(1).join(' ') || 'ban Instagram';
-  if (!handle) return sendTG(chatId, '❌ Handle manquant');
 
+  if (!num || num < 1) return sendTG(chatId, '❌ Numéro invalide. Tape `/status` pour voir les numéros.');
+
+  var acc = await findByNumber(num);
+  if (!acc) return sendTG(chatId, '❌ Compte #' + num + ' introuvable. Tape `/status` pour voir la liste.');
+
+  var handle = clean(acc.handle);
   var accounts = await getAllAccounts();
-  var acc = findAccountFuzzy(accounts, handle);
-  if (!acc) return sendTG(chatId, '❌ Compte @' + handle + ' introuvable dans le dashboard');
-  handle = clean(acc.handle); // Utiliser le vrai handle trouvé
-  if (acc.status === 'banned') return sendTG(chatId, '⚠️ @' + handle + ' est déjà marqué comme banni');
-
-  // Sauvegarder les infos warm-up du compte banni
-  var oldVa = acc.va || 'non-assigné';
-  var oldDay = 1;
-  if (acc.warmupStartedAt) {
-    oldDay = Math.floor((Date.now() - acc.warmupStartedAt) / 86400000) + 1;
-  }
-
-  // Marquer comme banni
-  await fbPatch('zenty/accounts/' + acc._fbId, {
-    status: 'banned',
-    bannedAt: new Date().toISOString(),
-    bannedReason: reason,
-    warmupStartedAt: null
-  });
-
-  // Chercher un spare
   var spare = findSpare(accounts);
+
   if (!spare) {
-    await sendTG(chatId, '⚠️ @' + handle + ' marqué *banni* mais *AUCUN spare disponible* !\nAjouter des comptes spare dans le dashboard.');
-    await notifyJordan( '🚨 *ALERTE WARM-UP*\n\n@' + handle + ' banni (' + reason + ')\n⚠️ *Pool spare VIDE* — pas de remplacement\nVA : ' + oldVa + ' (était à D' + oldDay + ')');
+    // Pas de spare — on note le problème mais on ne change rien
+    await sendTG(chatId, '⚠️ Compte #' + num + ' (@' + handle + ') a un problème mais *AUCUN spare disponible* !\nDemande à Jordan d\'ajouter des spares.');
+    await notifyJordan('🚨 *ALERTE WARM-UP*\n\n#' + num + ' @' + handle + ' — ' + reason + '\n⚠️ *Pool spare VIDE*\nVA : ' + (acc.va || '?'));
     return;
   }
 
-  // Activer le spare : reprend le VA, repart à D1
-  await fbPatch('zenty/accounts/' + spare._fbId, {
-    status: 'warmup',
-    va: oldVa,
-    warmupStartedAt: Date.now(),
-    replacedAccount: handle,
-    replacedReason: reason,
-    activatedAt: new Date().toISOString()
+  // Sauvegarder les anciennes credentials pour le log
+  var oldLogin = acc.originalUsername || acc.handle || '?';
+
+  // Swap credentials : prendre ceux du spare → les mettre sur le compte #N
+  await fbPatch('zenty/accounts/' + acc._fbId, {
+    originalUsername: spare.originalUsername || spare.handle || '',
+    password: spare.password || '',
+    secret2fa: spare.secret2fa || '',
+    bannedCredentials: oldLogin + ' (' + reason + ', ' + new Date().toISOString().substring(0, 10) + ')',
+    notes: ((acc.notes || '') + '\n[' + new Date().toISOString().substring(0, 10) + '] Credentials swapped: ' + oldLogin + ' -> ' + clean(spare.handle) + ' (' + reason + ')').trim()
   });
 
-  var spareHandle = clean(spare.handle);
+  // Supprimer le spare de la banque (usage unique)
+  await fbDelete('zenty/accounts/' + spare._fbId);
+
   var remainingSpares = accounts.filter(function(a) {
     return a.status === 'spare' && a._fbId !== spare._fbId;
   }).length;
 
-  await sendTG(chatId, '✅ *Remplacement effectué*\n\n' +
-    '❌ @' + handle + ' → banni (' + reason + ')\n' +
-    '✅ @' + spareHandle + ' → warm-up D1, assigné à ' + oldVa + '\n' +
+  var spareLogin = spare.originalUsername || spare.handle || '?';
+
+  await sendTG(chatId,
+    '✅ *Compte #' + num + ' — credentials remplacés*\n\n' +
+    '❌ Ancien login : `' + oldLogin + '` (' + reason + ')\n' +
+    '🔑 Nouveau login : `' + spareLogin + '`\n' +
+    '👤 VA : ' + (acc.va || '-') + ' — continue le warm-up normalement\n' +
     '📦 Spares restants : ' + remainingSpares);
 
-  // Notifier Jordan
-  await notifyJordan( '🔄 *ROTATION WARM-UP*\n\n' +
-    '❌ @' + handle + ' banni (' + reason + ')\n' +
-    '✅ Remplacé par @' + spareHandle + ' → D1\n' +
-    'VA : ' + oldVa + ' (était à D' + oldDay + ')\n' +
+  await notifyJordan(
+    '🔄 *SWAP CREDENTIALS #' + num + '*\n\n' +
+    'Ancien : `' + oldLogin + '` (' + reason + ')\n' +
+    'Nouveau : `' + spareLogin + '`\n' +
+    'VA : ' + (acc.va || '?') + '\n' +
     '📦 Spares restants : ' + remainingSpares +
     (remainingSpares <= 2 ? '\n⚠️ _Stock spare bas !_' : ''));
 }
 
+// ── /problem N raison ───────────────────────────────────────────
+
 async function cmdProblem(chatId, args) {
-  if (!args.length) return sendTG(chatId, '❌ Usage : `/problem @handle raison`');
-  var handle = clean(args[0]);
+  if (!args.length) return sendTG(chatId, '❌ Usage : `/problem N raison`\nExemple : `/problem 5 restrict actions`');
+  var num = parseInt(args[0], 10);
   var reason = args.slice(1).join(' ') || 'problème signalé';
-  if (!handle) return sendTG(chatId, '❌ Handle manquant');
 
-  var accounts = await getAllAccounts();
-  var acc = findAccountFuzzy(accounts, handle);
-  if (!acc) return sendTG(chatId, '❌ Compte @' + handle + ' introuvable');
-  handle = clean(acc.handle);
+  if (!num || num < 1) return sendTG(chatId, '❌ Numéro invalide. Tape `/status` pour voir les numéros.');
 
-  // Ajouter une note au compte sans changer le statut
-  var notes = (acc.notes || '') + '\n[' + new Date().toISOString().substring(0, 10) + '] ' + reason;
+  var acc = await findByNumber(num);
+  if (!acc) return sendTG(chatId, '❌ Compte #' + num + ' introuvable.');
+
+  var handle = clean(acc.handle);
+  var notes = ((acc.notes || '') + '\n[' + new Date().toISOString().substring(0, 10) + '] ' + reason).trim();
   await fbPatch('zenty/accounts/' + acc._fbId, {
-    notes: notes.trim(),
+    notes: notes,
     lastIssue: reason,
     lastIssueAt: new Date().toISOString()
   });
 
-  await sendTG(chatId, '📝 Problème noté pour @' + handle + ' : ' + reason);
-
-  // Notifier Jordan
-  await notifyJordan( '⚠️ *PROBLÈME WARM-UP*\n\n@' + handle + ' : ' + reason + '\nStatut : ' + (acc.status || '?') + '\nVA : ' + (acc.va || '?'));
+  await sendTG(chatId, '📝 Problème noté pour #' + num + ' (@' + handle + ') : ' + reason);
+  await notifyJordan('⚠️ *PROBLÈME #' + num + '* @' + handle + ' : ' + reason + '\nVA : ' + (acc.va || '?'));
 }
 
-async function cmdReplace(chatId, args) {
-  if (args.length < 2) return sendTG(chatId, '❌ Usage : `/replace @ancien @nouveau`');
-  var oldHandle = clean(args[0]);
-  var newHandle = clean(args[1]);
-
-  var accounts = await getAllAccounts();
-  var oldAcc = findAccountFuzzy(accounts, oldHandle);
-  var newAcc = findAccountFuzzy(accounts, newHandle);
-
-  if (!oldAcc) return sendTG(chatId, '❌ @' + oldHandle + ' introuvable');
-  if (!newAcc) return sendTG(chatId, '❌ @' + newHandle + ' introuvable');
-  oldHandle = clean(oldAcc.handle);
-  newHandle = clean(newAcc.handle);
-  if (newAcc.status !== 'spare') return sendTG(chatId, '⚠️ @' + newHandle + ' n\'est pas un spare (statut: ' + newAcc.status + ')');
-
-  var oldVa = oldAcc.va || 'non-assigné';
-
-  // Bannir l'ancien
-  await fbPatch('zenty/accounts/' + oldAcc._fbId, {
-    status: 'banned',
-    bannedAt: new Date().toISOString(),
-    bannedReason: 'remplacé manuellement'
-  });
-
-  // Activer le nouveau
-  await fbPatch('zenty/accounts/' + newAcc._fbId, {
-    status: 'warmup',
-    va: oldVa,
-    warmupStartedAt: Date.now(),
-    replacedAccount: oldHandle,
-    activatedAt: new Date().toISOString()
-  });
-
-  await sendTG(chatId, '✅ @' + oldHandle + ' → banni\n✅ @' + newHandle + ' → warm-up D1, VA: ' + oldVa);
-  await notifyJordan( '🔄 *SWAP MANUEL*\n@' + oldHandle + ' → @' + newHandle + '\nVA : ' + oldVa);
-}
+// ── /status ─────────────────────────────────────────────────────
 
 async function cmdStatus(chatId) {
   var accounts = await getAllAccounts();
+  var numMap = await getNumberMap();
+
+  // Inverser la map : accId → num
+  var idToNum = {};
+  Object.keys(numMap).forEach(function(n) { idToNum[numMap[n]] = n; });
+
   var warmup = accounts.filter(function(a) { return a.status === 'warmup'; });
   var spares = accounts.filter(function(a) { return a.status === 'spare'; });
   var banned = accounts.filter(function(a) { return a.status === 'banned'; });
@@ -255,54 +192,50 @@ async function cmdStatus(chatId) {
   if (warmup.length) {
     lines.push('🟡 *Warm-up (' + warmup.length + ')* :');
     warmup.forEach(function(a) {
+      var num = idToNum[a._fbId] || '?';
       var day = a.warmupStartedAt ? Math.floor((Date.now() - a.warmupStartedAt) / 86400000) + 1 : '?';
-      var va = a.va || '-';
       var issue = a.lastIssue ? ' ⚠️' : '';
-      lines.push('  • @' + clean(a.handle) + ' — D' + day + ' — VA: ' + va + issue);
+      lines.push('  #' + num + ' @' + clean(a.handle) + ' — D' + day + ' — VA: ' + (a.va || '-') + issue);
     });
   }
 
   if (automated.length) {
     lines.push('\n🟢 *Actifs (' + automated.length + ')* :');
     automated.forEach(function(a) {
-      lines.push('  • @' + clean(a.handle));
+      var num = idToNum[a._fbId] || '?';
+      lines.push('  #' + num + ' @' + clean(a.handle));
     });
   }
 
-  if (spares.length) {
-    lines.push('\n⚪ *Spare (' + spares.length + ')* :');
-    spares.forEach(function(a) {
-      lines.push('  • @' + clean(a.handle));
-    });
-  } else {
-    lines.push('\n⚪ *Spare : AUCUN* ⚠️');
-  }
+  lines.push('\n📦 *Spares dispo : ' + spares.length + '*' + (spares.length <= 2 ? ' ⚠️' : ''));
 
   if (banned.length) {
-    lines.push('\n🔴 *Bannis (' + banned.length + ')* :');
-    banned.slice(-5).forEach(function(a) {
-      var reason = a.bannedReason || '';
-      lines.push('  • @' + clean(a.handle) + (reason ? ' (' + reason + ')' : ''));
+    lines.push('\n🔴 *Bannis récents (' + banned.length + ')* :');
+    banned.slice(-3).forEach(function(a) {
+      lines.push('  @' + clean(a.handle) + (a.bannedReason ? ' (' + a.bannedReason + ')' : ''));
     });
   }
 
   await sendTG(chatId, lines.join('\n'));
 }
 
+// ── /help ───────────────────────────────────────────────────────
+
 function cmdHelp(chatId) {
-  return sendTG(chatId, '*🤖 Bot Zenty Warm-up*\n\n' +
-    '`/ban @handle raison` — bannir + remplacement auto par spare\n' +
-    '`/problem @handle raison` — signaler un problème\n' +
-    '`/replace @ancien @nouveau` — swap manuel\n' +
-    '`/status` — voir tous les comptes\n' +
-    '`/help` — cette aide');
+  return sendTG(chatId,
+    '*🤖 Bot Zenty Warm-up*\n\n' +
+    '`/ban N raison` — remplacer les credentials du compte #N par un spare\n' +
+    '`/problem N raison` — signaler un problème\n' +
+    '`/status` — voir tous les comptes avec leurs numéros\n' +
+    '`/help` — cette aide\n\n' +
+    '_N = numéro du compte affiché dans le dashboard_');
 }
 
 // ── Webhook Handler ─────────────────────────────────────────────
 
 module.exports = async function handler(req, res) {
   if (!TG_TOKEN) {
-    res.status(200).json({ ok: false, message: 'TG_WARMUP_BOT_TOKEN not configured in Vercel env vars' });
+    res.status(200).json({ ok: false, message: 'TG_WARMUP_BOT_TOKEN not configured' });
     return;
   }
   if (req.method !== 'POST') {
@@ -317,40 +250,23 @@ module.exports = async function handler(req, res) {
       return;
     }
 
-    var msg = update.message;
-    var chatId = msg.chat.id;
-    var text = (msg.text || '').trim();
-
-    // Parse command
+    var chatId = update.message.chat.id;
+    var text = (update.message.text || '').trim();
     var parts = text.split(/\s+/);
-    var cmd = (parts[0] || '').toLowerCase().replace(/@\w+$/, ''); // strip @botname
+    var cmd = (parts[0] || '').toLowerCase().replace(/@\w+$/, '');
     var args = parts.slice(1);
 
     switch (cmd) {
-      case '/ban':
-        await cmdBan(chatId, args);
-        break;
-      case '/problem':
-        await cmdProblem(chatId, args);
-        break;
-      case '/replace':
-        await cmdReplace(chatId, args);
-        break;
-      case '/status':
-        await cmdStatus(chatId);
-        break;
+      case '/ban':     await cmdBan(chatId, args); break;
+      case '/problem': await cmdProblem(chatId, args); break;
+      case '/status':  await cmdStatus(chatId); break;
       case '/help':
-      case '/start':
-        await cmdHelp(chatId);
-        break;
-      default:
-        // Ignorer les messages non-commande
-        break;
+      case '/start':   await cmdHelp(chatId); break;
     }
 
     res.status(200).json({ ok: true });
   } catch (e) {
     console.error('[TG Bot Error]', e);
-    res.status(200).json({ ok: true }); // Toujours 200 pour Telegram
+    res.status(200).json({ ok: true });
   }
 };
