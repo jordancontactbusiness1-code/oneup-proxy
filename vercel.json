@@ -4,6 +4,11 @@
     "api/[...path].js": {
       "memory": 128,
       "maxDuration": 10
+    },
+    "api/daily-trigger.js": {
+      "memory": 256,
+      "maxDuration": 60
     }
-  }
+  },
+  "crons": []
 }
