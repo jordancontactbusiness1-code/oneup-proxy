@@ -58,6 +58,15 @@ function parisDateStr(d) {
   return p.getFullYear() + '-' + pad(p.getMonth() + 1) + '-' + pad(p.getDate());
 }
 
+// Check si un slot HH:MM est encore dans le futur (Paris time, +5min buffer)
+function isSlotFutureParis(slotTime) {
+  if (!/^\d{1,2}:\d{2}$/.test(slotTime)) return false;
+  const now = new Date(new Date().toLocaleString('en-US', { timeZone: 'Europe/Paris' }));
+  const nowMin = now.getHours() * 60 + now.getMinutes() + 5;
+  const p = slotTime.split(':');
+  return (parseInt(p[0]) * 60 + parseInt(p[1])) >= nowMin;
+}
+
 // Génère un slot horaire dans une fenêtre pour un compte donné.
 // accountIdx étale les comptes uniformément dans la fenêtre (stagger).
 function generateSlot(window, targetParisDateStr, accountIdx, totalAccounts) {
@@ -104,20 +113,46 @@ async function sendTelegram(text) {
   } catch (e) { /* silent */ }
 }
 
-// ── Google Drive OAuth ────────────────────────────────────────────────────────
+// ── Google Drive Auth — Service Account JWT (no expiration) ──────────────────
+// Migration 2026-04-14 : refresh_token expirait toutes les 7j (project en mode Testing).
+// Service account n'expire pas et accède aux dossiers Drive partagés avec son email.
+const SA_PATH = process.env.GDRIVE_SA_PATH || '/opt/zenty-cron/drive-sa.json';
+let _saCache = null;
+function _loadSA() {
+  if (!_saCache) _saCache = JSON.parse(require('fs').readFileSync(SA_PATH, 'utf-8'));
+  return _saCache;
+}
+function _b64url(buf) { return Buffer.from(buf).toString('base64').replace(/=+$/, '').replace(/\+/g, '-').replace(/\//g, '_'); }
 async function getOAuthToken() {
+  // Fallback refresh_token si SA manquant (backward compat)
+  if (!require('fs').existsSync(SA_PATH)) {
+    const r = await fetch('https://oauth2.googleapis.com/token', {
+      method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({client_id: GDRIVE_ID, client_secret: GDRIVE_SECRET, refresh_token: GDRIVE_TOKEN, grant_type: 'refresh_token'}).toString()
+    });
+    const d = await r.json();
+    if (!d.access_token) throw new Error('OAuth refresh failed: ' + JSON.stringify(d));
+    return d.access_token;
+  }
+  const sa = _loadSA();
+  const crypto = require('crypto');
+  const now = Math.floor(Date.now() / 1000);
+  const header = _b64url(JSON.stringify({alg: 'RS256', typ: 'JWT'}));
+  const claim = _b64url(JSON.stringify({
+    iss: sa.client_email,
+    scope: 'https://www.googleapis.com/auth/drive',
+    aud: 'https://oauth2.googleapis.com/token',
+    exp: now + 3600,
+    iat: now
+  }));
+  const sig = _b64url(crypto.sign('RSA-SHA256', Buffer.from(header + '.' + claim), sa.private_key));
+  const jwt = header + '.' + claim + '.' + sig;
   const r = await fetch('https://oauth2.googleapis.com/token', {
-    method:  'POST',
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-    body:    new URLSearchParams({
-      client_id:     GDRIVE_ID,
-      client_secret: GDRIVE_SECRET,
-      refresh_token: GDRIVE_TOKEN,
-      grant_type:    'refresh_token'
-    }).toString()
+    method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({grant_type: 'urn:ietf:params:oauth:grant-type:jwt-bearer', assertion: jwt}).toString()
   });
   const d = await r.json();
-  if (!d.access_token) throw new Error('OAuth refresh failed: ' + JSON.stringify(d));
+  if (!d.access_token) throw new Error('SA JWT auth failed: ' + JSON.stringify(d));
   return d.access_token;
 }
 
@@ -166,7 +201,7 @@ async function fetchAllScheduledPosts() {
 // Filtre en mémoire — pas d'appel API (allPosts déjà chargé)
 function countScheduledByType(allPosts, username, targetDateStr) {
   const todayPosts = allPosts.filter(function(p) {
-    const dt = p.date_time || p.scheduled_date_time || '';
+    const dt = p.date_time || p.scheduled_date_time || p.created_at || '';
     const un = (p.social_network_username || p.social_network_name || '').replace('@', '').toLowerCase();
     return dt.startsWith(targetDateStr) && un === username.toLowerCase();
   });
@@ -196,19 +231,28 @@ function countScheduledByType(allPosts, username, targetDateStr) {
 // Modèle : claude-haiku-4-5-20251001 (rapide, économique, ~1-2s)
 // ─────────────────────────────────────────────────────────────────────────────
 
-async function callAnthropic(uname, template) {
-  // Exemples fixes OFM style (anchor le modele sur le bon registre)
+async function callAnthropic(uname, template, fileName) {
+  // Extraire contexte du nom de fichier
+  var fileCtx = '';
+  if (fileName) {
+    var clean = fileName.replace(/\.(mp4|mov|jpg|jpeg|png|gif|webp)$/i, '')
+      .replace(/[_\-]/g, ' ').replace(/\s+/g, ' ').trim();
+    if (!/^(video|img|image|reel|story|dsc|mov)\s*\d*$/i.test(clean)) fileCtx = clean;
+  }
+
+  var contextLine = fileCtx
+    ? 'Ce Reel a pour theme : "' + fileCtx + '".\n'
+    : '';
+
   const examples = [
-    'dans mes pensees \uD83C\uDF19',
-    'juste moi, aujourd\'hui \u2728',
-    'quelque chose de doux \uD83E\uDD0D',
-    'un peu de moi pour toi \uD83E\uDEF6',
-    'douce comme toujours \uD83C\uDF38',
-    'la vie est belle quand on sait ou regarder \u2728\uD83C\uDF3F'
+    'Tu me crois ou je dois prouver ? \uD83D\uDE44',
+    'Alors t\'as quel age ? \uD83D\uDE44',
+    'T\'aurais pense le contraire ? \uD83D\uDE44',
+    'C\'est si difficile que ca a comprendre ? \uD83D\uDC49\uD83D\uDC48',
+    'Tu me laisserais entrer ? \uD83D\uDE44',
+    'C\'est si bien que ca ? \uD83D\uDE44'
   ];
-  const styleBlock = template
-    ? 'Exemples de captions validees :\n- ' + template + '\n- ' + examples.slice(0, 3).join('\n- ')
-    : 'Exemples de captions validees :\n- ' + examples.join('\n- ');
+  const styleBlock = 'CAPTIONS REELLES top performers :\n- ' + examples.join('\n- ');
 
   const r = await fetch('https://api.anthropic.com/v1/messages', {
     method:  'POST',
@@ -222,7 +266,7 @@ async function callAnthropic(uname, template) {
       max_tokens: 100,
       messages: [{
         role:    'user',
-        content: 'Tu geres le compte Instagram OFM @' + uname + ' (crearice de contenu francophone, niche girl-next-door, audience masculine FR).\n' + styleBlock + '\n\nGenere UNE nouvelle caption dans ce meme style :\n- 1 a 3 lignes max\n- 2-3 emojis\n- Ton intime, personnel, leger, authentique\n- SANS hashtags, SANS questions generiques, SANS references aux reseaux sociaux\n- Unique — ne pas copier les exemples\n\nReponds UNIQUEMENT avec la caption, rien d\'autre.'
+        content: 'Tu geres le compte Instagram OFM @' + uname + ' (creatrice de contenu francophone, niche girl-next-door, audience masculine FR).\n' + contextLine + styleBlock + '\n\nGenere UNE nouvelle caption :\n- La caption DOIT etre en lien avec le contexte du Reel\n- TOUJOURS une question avec tutoiement\n- 5 a 10 mots, 1 seule ligne\n- Emoji \uD83D\uDE44 en priorite, sinon \uD83D\uDC40 ou \uD83D\uDE0C\n- Ton : provocant, taquin, defiant — PAS doux ni murmure\n- Francais oral/familier : "t\'as", "ca", "t\'aurais"\n- SANS hashtags\n- NE COPIE PAS les exemples\n- Sois CREATIF et VARIE\n\nReponds UNIQUEMENT avec la caption, rien d\'autre.'
       }]
     })
   });
@@ -231,7 +275,7 @@ async function callAnthropic(uname, template) {
   return ((d.content && d.content[0] && d.content[0].text) || '').trim();
 }
 
-async function generateCaption(fileId, type, uname, captionCfg) {
+async function generateCaption(fileId, type, uname, captionCfg, fileName) {
   const template = (captionCfg && captionCfg.template) || '';
 
   // Stories : template uniquement (pas d'IA)
@@ -252,7 +296,7 @@ async function generateCaption(fileId, type, uname, captionCfg) {
 
   // Appel Anthropic
   try {
-    const caption = await callAnthropic(uname, template);
+    const caption = await callAnthropic(uname, template, fileName);
     // Écriture cache en arrière-plan (silencieux si échec)
     fbPut(cacheKey, { text: caption, generatedAt: Date.now(), account: uname }).catch(function() {});
     console.log('[caption] Generated @' + uname + ': "' + caption.substring(0, 50) + '"');
@@ -263,13 +307,61 @@ async function generateCaption(fileId, type, uname, captionCfg) {
   }
 }
 
+// ═══════════════════════════════════════════════════════════════════════════════
+// STORIES — REGLE ABSOLUE (ne JAMAIS contourner)
+// ═══════════════════════════════════════════════════════════════════════════════
+// Bug OneUp confirmé 2026-04-13 : scheduleimagepost + isStory:true poste
+// ~50% des images sur la GRILLE FEED au lieu de Story 24h (4/4 comptes affectes).
+// Workaround OBLIGATOIRE : conversion image -> mp4 5s via ensureStoryVideo()
+// (endpoint /api/ensure-story-video, ffmpeg) puis schedulevideopost + isStory:true.
+// Test validé sur @lapetitetinaa 2026-04-13 12:12 Paris (Story 24h confirmée).
+//
+// SI TU MODIFIES schedulePost() ou ensureStoryVideo() :
+// - Toute story image DOIT passer par ensureStoryVideo AVANT scheduling
+// - JAMAIS appeler scheduleimagepost avec isStory:true direct
+// - Voir lecon : ZentyBrain/CERVEAU-MERE/08-LEARNINGS/lecon-oneup-image-story-mp4-conversion.md
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// ── Convertit une image story en mp4 5s via le proxy (cache sur Drive) ────────
+async function ensureStoryVideo(fileId, parentFolderId) {
+  try {
+    const r = await fetch('https://dashboard.jscaledashboard.online/api/ensure-story-video', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ fileId: fileId, parentFolderId: parentFolderId })
+    });
+    const d = await r.json();
+    if (d && d.videoFileId) return d.videoFileId;
+    console.warn('[ensureStoryVideo] No videoFileId returned:', JSON.stringify(d));
+    return null;
+  } catch (e) {
+    console.error('[ensureStoryVideo] Error:', e.message);
+    return null;
+  }
+}
+
 // ── Programmer un post sur OneUp ──────────────────────────────────────────────
 // content : caption IA ou template fallback
-async function schedulePost(snId, catId, fileId, dateStr, type, fileName, content) {
-  const mediaUrl   = 'https://dashboard.jscaledashboard.online/api/drive-serve?fileId=' + fileId;
+// storyParentFolderId : dossier stories/ du compte (requis pour stories image -> mp4 cache)
+async function schedulePost(snId, catId, fileId, dateStr, type, fileName, content, storyParentFolderId) {
   const isStory    = type === 'stories';
   const isCarousel = type === 'carousel';
-  const isImage    = /\.(jpg|jpeg|png|gif|webp)$/i.test(fileName || '');
+  let   isImage    = /\.(jpg|jpeg|png|gif|webp)$/i.test(fileName || '');
+  let   actualFileId = fileId;
+
+  // Story image -> convertir en mp4 (workaround bug OneUp)
+  if (isStory && isImage && storyParentFolderId) {
+    const mp4Id = await ensureStoryVideo(fileId, storyParentFolderId);
+    if (mp4Id) {
+      actualFileId = mp4Id;
+      isImage = false;
+      console.log('[story] Image converted to mp4: ' + fileId.substring(0,12) + ' -> ' + mp4Id.substring(0,12));
+    } else {
+      console.warn('[story] Conversion failed for ' + fileName + ' -> fallback scheduleimagepost (risk: feed grid)');
+    }
+  }
+
+  const mediaUrl   = 'https://dashboard.jscaledashboard.online/api/drive-serve?fileId=' + actualFileId;
   const endpoint   = (isCarousel || (isStory && isImage))
     ? '/api/scheduleimagepost'
     : '/api/schedulevideopost';
@@ -301,11 +393,12 @@ async function schedulePost(snId, catId, fileId, dateStr, type, fileName, conten
       body:    body.toString()
     });
     const d = await r.json();
-    if (d && d.error) return { ok: false, postId: null, error: d.message || JSON.stringify(d) };
+    if (d && d.error) return { ok: false, postId: null, error: d.message || JSON.stringify(d), convertedFileId: null };
     const postId = d && (d.post_id || d.id || (d.data && d.data.id) || null);
-    return { ok: true, postId: String(postId || ''), error: null };
+    // convertedFileId = mp4 généré depuis image (différent de fileId original) → à déplacer aussi vers posted
+    return { ok: true, postId: String(postId || ''), error: null, convertedFileId: actualFileId !== fileId ? actualFileId : null };
   } catch (e) {
-    return { ok: false, postId: null, error: e.message };
+    return { ok: false, postId: null, error: e.message, convertedFileId: null };
   }
 }
 
@@ -320,7 +413,9 @@ module.exports = async function handler(req, res) {
 
   const startTime     = Date.now();
   const targetDateStr = parisDateStr(new Date());
-  console.log('[cron v3] Starting for Paris date: ' + targetDateStr);
+  const mode          = (req.query && req.query.mode) || 'daily'; // 'daily' (1h Paris full run) | 'checker' (toutes 30min, corrige les trous)
+  const isChecker     = mode === 'checker';
+  console.log('[cron v3 ' + mode + '] Starting for Paris date: ' + targetDateStr);
 
   try {
     // 1. Config Firebase
@@ -338,16 +433,26 @@ module.exports = async function handler(req, res) {
     console.log('[cron v3] Caption mode: ' + (captionCfg.enabled ? 'IA Claude Haiku' : 'Template "' + (captionCfg.template || 'vide') + '"'));
 
     // 2. OAuth Drive + prefetch OneUp en parallèle (une seule fois pour tout le run)
+    // En mode CHECKER : aussi fetch published pour exclure ce qui a déjà été publié
     var oauthToken     = null;
     var allOneupPosts  = [];
-    const [oauthResult, oneupResult] = await Promise.allSettled([
+    const fetchPubPromise = isChecker
+      ? fetch(ONEUP_BASE + '/api/getpublishedposts?start=0&apiKey=' + ONEUP_KEY).then(function(r){ return r.json(); }).then(function(d){ return Array.isArray(d) ? d : (d.data || []); }).catch(function(){ return []; })
+      : Promise.resolve([]);
+    const [oauthResult, oneupResult, pubResult] = await Promise.allSettled([
       Object.keys(driveFolderMap).length > 0 ? getOAuthToken() : Promise.resolve(null),
-      fetchAllScheduledPosts()
+      fetchAllScheduledPosts(),
+      fetchPubPromise
     ]);
     if (oauthResult.status === 'fulfilled')  oauthToken    = oauthResult.value;
     else console.error('[drive] OAuth failed:', oauthResult.reason && oauthResult.reason.message);
     if (oneupResult.status === 'fulfilled')  allOneupPosts = oneupResult.value;
     else console.error('[oneup] fetchAll failed:', oneupResult.reason && oneupResult.reason.message);
+    // En mode checker, concat les published pour les compter dans countScheduledByType
+    if (isChecker && pubResult.status === 'fulfilled' && Array.isArray(pubResult.value)) {
+      allOneupPosts = allOneupPosts.concat(pubResult.value);
+      console.log('[checker] +' + pubResult.value.length + ' published posts ajoutés au calcul existing');
+    }
 
     const _usedFileIds  = new Set();
     const accountList   = Object.keys(accounts);
@@ -369,8 +474,15 @@ module.exports = async function handler(req, res) {
       if (!acc || !acc.username) continue;
       const uname = acc.username.replace('@', '').toLowerCase();
 
-      // Déjà schedulé aujourd'hui (flag Firebase)
-      if (acc.lastScheduledDate === targetDateStr) {
+      // Pause manuelle (bouton Stop dashboard V2)
+      if (acc.paused === true) {
+        skippedCount++;
+        skippedReasons.push('⏸ @' + uname + ' — pause manuelle');
+        continue;
+      }
+
+      // Déjà schedulé aujourd'hui (flag Firebase) — mais checker IGNORE ce flag pour re-vérifier
+      if (acc.lastScheduledDate === targetDateStr && !isChecker) {
         skippedCount++;
         skippedReasons.push('⏭ @' + uname + ' — déjà schedulé');
         continue;
@@ -378,30 +490,66 @@ module.exports = async function handler(req, res) {
 
       // Double-check OneUp (filet anti-race-condition) — filtre en mémoire, 0 appel API
       const existing    = countScheduledByType(allOneupPosts, uname, targetDateStr);
-      const needReels   = Math.max(0, (acc.reels   || 0) - existing.reels);
-      const needStories = Math.max(0, (acc.stories || 0) - existing.stories);
-      const needFeed    = Math.max(0, (acc.feed    || 0) - existing.carousel);
+      let needReels   = Math.max(0, (acc.reels   || 0) - existing.reels);
+      let needStories = Math.max(0, (acc.stories || 0) - existing.stories);
+      let needFeed    = Math.max(0, (acc.feed    || 0) - existing.carousel);
 
       if (needReels + needStories + needFeed === 0) {
         skippedCount++;
-        await fbPut('zenty/cron_config/accounts/' + snId + '/lastScheduledDate', targetDateStr);
+        if (!isChecker) await fbPut('zenty/cron_config/accounts/' + snId + '/lastScheduledDate', targetDateStr);
         skippedReasons.push('⏭ @' + uname + ' — quota atteint (' + existing.reels + 'R/' + existing.stories + 'S)');
         continue;
       }
 
       // Marquer Firebase EN COURS avant tout scheduling (anti-race-condition)
-      await fbPut('zenty/cron_config/accounts/' + snId + '/lastScheduledDate', targetDateStr);
+      // Mode checker : NE PAS marquer (on veut pouvoir re-vérifier dans 30min)
+      if (!isChecker) {
+        await fbPut('zenty/cron_config/accounts/' + snId + '/lastScheduledDate', targetDateStr);
+      }
       accountResults[snId] = { uname: uname, scheduled: 0, errors: [] };
 
       const folders   = driveFolderMap[uname] || {};
       const carFolder = folders.carousel || folders.feed || null;
 
       // Lister tous les dossiers Drive UNE seule fois en parallèle
-      const [allReelFiles, allStoryFiles, allCarouselFiles] = await Promise.all([
+      const [allReelFilesRaw, allStoryFilesRaw, allCarouselFiles] = await Promise.all([
         (folders.reels   && oauthToken) ? listDriveFolder(oauthToken, folders.reels)   : Promise.resolve([]),
         (folders.stories && oauthToken) ? listDriveFolder(oauthToken, folders.stories) : Promise.resolve([]),
         (carFolder       && oauthToken) ? listDriveFolder(oauthToken, carFolder)       : Promise.resolve([])
       ]);
+
+      // Filtrer les fichiers cache mp4 (issus de la conversion image->story video).
+      // Pattern : nom = nom_original.{jpg,jpeg,png,gif,webp}.mp4
+      const isStoryCacheMp4 = function(name) { return /\.(jpg|jpeg|png|gif|webp)\.mp4$/i.test(name || ''); };
+      const allReelFiles  = allReelFilesRaw.filter(function(f){ return !isStoryCacheMp4(f.name); });
+      const allStoryFiles = allStoryFilesRaw.filter(function(f){ return !isStoryCacheMp4(f.name); });
+
+      // Slots custom (Dashboard V2 → Firebase). Si présents, ils overrident PEAK_WINDOWS.
+      let customReelSlots     = (acc.slots && Array.isArray(acc.slots.reels))    ? acc.slots.reels    : null;
+      let customStorySlots    = (acc.slots && Array.isArray(acc.slots.stories))  ? acc.slots.stories  : null;
+      let customCarouselSlots = (acc.slots && Array.isArray(acc.slots.carousel)) ? acc.slots.carousel : null;
+
+      // Mode CHECKER : ne planifier que les slots FUTURS aujourd'hui (>now+5min Paris)
+      // Si pas de slots custom en mode checker → skip (pas safe de générer slots aléatoires en cours de journée)
+      if (isChecker) {
+        if (!customReelSlots && !customStorySlots && !customCarouselSlots) {
+          skippedCount++;
+          skippedReasons.push('⏭ @' + uname + ' — checker skip (pas de slots custom)');
+          continue;
+        }
+        customReelSlots     = customReelSlots     ? customReelSlots.filter(isSlotFutureParis)     : null;
+        customStorySlots    = customStorySlots    ? customStorySlots.filter(isSlotFutureParis)    : null;
+        customCarouselSlots = customCarouselSlots ? customCarouselSlots.filter(isSlotFutureParis) : null;
+        // Cap les need à la longueur des slots futurs disponibles
+        if (customReelSlots)     needReels   = Math.min(needReels,   customReelSlots.length);
+        if (customStorySlots)    needStories = Math.min(needStories, customStorySlots.length);
+        if (customCarouselSlots) needFeed    = Math.min(needFeed,    customCarouselSlots.length);
+        if (needReels + needStories + needFeed === 0) {
+          skippedCount++;
+          skippedReasons.push('⏭ @' + uname + ' — quota OK ou slots passés');
+          continue;
+        }
+      }
 
       // Sélectionner les Reels
       for (var ri = 0; ri < needReels; ri++) {
@@ -412,6 +560,7 @@ module.exports = async function handler(req, res) {
         plan.push({
           snId: snId, acc: acc, uname: uname, file: file, type: 'reels',
           window: PEAK_WINDOWS.reels[ri] || PEAK_WINDOWS.reels[PEAK_WINDOWS.reels.length - 1],
+          customTime: (customReelSlots && customReelSlots[ri]) || null,
           accountIdx: accountIdx, fromFolder: folders.reels, toFolder: folders.posted,
           caption: null, slot: null
         });
@@ -426,6 +575,7 @@ module.exports = async function handler(req, res) {
         plan.push({
           snId: snId, acc: acc, uname: uname, file: file, type: 'stories',
           window: PEAK_WINDOWS.stories[si] || PEAK_WINDOWS.stories[PEAK_WINDOWS.stories.length - 1],
+          customTime: (customStorySlots && customStorySlots[si]) || null,
           accountIdx: accountIdx, fromFolder: folders.stories, toFolder: folders.posted,
           caption: null, slot: null
         });
@@ -440,6 +590,7 @@ module.exports = async function handler(req, res) {
         plan.push({
           snId: snId, acc: acc, uname: uname, file: file, type: 'carousel',
           window: PEAK_WINDOWS.carousel[ci] || PEAK_WINDOWS.carousel[PEAK_WINDOWS.carousel.length - 1],
+          customTime: (customCarouselSlots && customCarouselSlots[ci]) || null,
           accountIdx: accountIdx, fromFolder: carFolder, toFolder: folders.posted,
           caption: null, slot: null
         });
@@ -462,7 +613,7 @@ module.exports = async function handler(req, res) {
           const batch = plan.slice(ci2, ci2 + CAPTION_BATCH);
           await Promise.all(
             batch.map(function(item) {
-              return generateCaption(item.file.id, item.type, item.uname, captionCfg)
+              return generateCaption(item.file.id, item.type, item.uname, captionCfg, item.file.name)
                 .then(function(cap) { item.caption = cap; });
             })
           );
@@ -473,9 +624,21 @@ module.exports = async function handler(req, res) {
         if (captionCfg.template) console.log('[caption] Mode template — "' + captionCfg.template + '"');
       }
 
-      // Générer les slots horaires
+      // Générer les slots horaires : custom Firebase si dispo (fourchette ±25min anti-flag IG, Jordan 2026-04-14), sinon PEAK_WINDOWS
       plan.forEach(function(item) {
-        item.slot = generateSlot(item.window, targetDateStr, item.accountIdx, totalAccounts);
+        if (item.customTime && /^([01]?\d|2[0-3]):[0-5]\d$/.test(item.customTime)) {
+          var parts = item.customTime.split(':');
+          var jitter = Math.floor(Math.random() * 51) - 25; // -25..+25 min (fourchette ~1h anti-flag)
+          var h = parseInt(parts[0]);
+          var m = parseInt(parts[1]) + jitter;
+          if (m < 0) { m += 60; h--; }
+          if (m >= 60) { m -= 60; h++; }
+          if (h < 0) h = 0;
+          if (h > 23) h = 23;
+          item.slot = targetDateStr + ' ' + (h<10?'0':'') + h + ':' + (m<10?'0':'') + m;
+        } else {
+          item.slot = generateSlot(item.window, targetDateStr, item.accountIdx, totalAccounts);
+        }
       });
     }
 
@@ -493,7 +656,8 @@ module.exports = async function handler(req, res) {
         batch.map(async function(item) {
           const result = await schedulePost(
             item.snId, item.acc.category_id, item.file.id,
-            item.slot, item.type, item.file.name, item.caption
+            item.slot, item.type, item.file.name, item.caption,
+            item.fromFolder
           );
           if (result.ok) {
             scheduledTotal++;
@@ -501,6 +665,10 @@ module.exports = async function handler(req, res) {
             if (item.toFolder && item.fromFolder && oauthToken) {
               const moved = await moveFileToDrive(oauthToken, item.file.id, item.fromFolder, item.toFolder);
               if (!moved) console.warn('[drive] Move failed: ' + item.file.name + ' @' + item.uname);
+              // Si une conversion image->mp4 a eu lieu, déplacer aussi le mp4 cache pour garder stories/ propre
+              if (result.convertedFileId) {
+                await moveFileToDrive(oauthToken, result.convertedFileId, item.fromFolder, item.toFolder).catch(function(){});
+              }
             }
           } else {
             failedTotal++;
@@ -529,15 +697,21 @@ module.exports = async function handler(req, res) {
     const dur         = ((Date.now() - startTime) / 1000).toFixed(1);
     const emoji       = failedTotal > 0 ? '⚠️' : '⚡';
     const captionMode = captionCfg.enabled ? '✨ Claude IA' : '📝 Template';
+    const titlePrefix = isChecker ? '🔧 *Zenty Checker (auto-fix)*' : (emoji + ' *Zenty Daily Scheduler v3*');
     const lines       = [
-      emoji + ' *Zenty Daily Scheduler v3* — ' + targetDateStr,
+      titlePrefix + ' — ' + targetDateStr,
       '',
       '📊 ' + totalAccounts + ' comptes | ' + scheduledTotal + ' programmés | ' + skippedCount + ' déjà OK | ' + failedTotal + ' erreur(s)',
       '🖊️ Captions: ' + captionMode
     ];
     if (results.length) lines.push('', results.join('\n'));
     lines.push('\n⏱ ' + dur + 's');
-    await sendTelegram(lines.join('\n'));
+    // Mode CHECKER : Telegram silent si rien à corriger (évite spam toutes les 30min)
+    if (isChecker && scheduledTotal === 0 && failedTotal === 0) {
+      console.log('[checker] Silent (rien à corriger).');
+    } else {
+      await sendTelegram(lines.join('\n'));
+    }
 
     res.status(200).json({
       ok:          true,
