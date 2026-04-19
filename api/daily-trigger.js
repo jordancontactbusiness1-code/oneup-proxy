@@ -199,7 +199,12 @@ async function fetchAllScheduledPosts() {
 }
 
 // Filtre en mémoire — pas d'appel API (allPosts déjà chargé)
-function countScheduledByType(allPosts, username, targetDateStr) {
+// typeMap : registry Firebase post_id -> {type: 'reels'|'stories'|'carousel'}
+// ecrit par cron+dashboard apres chaque schedule. Source de verite — OneUp API
+// getscheduledposts ne renvoie PAS le champ instagram/isStory, donc impossible
+// de distinguer story video vs reel video sans ce registry (bug 2026-04-19).
+function countScheduledByType(allPosts, username, targetDateStr, typeMap) {
+  typeMap = typeMap || {};
   const todayPosts = allPosts.filter(function(p) {
     const dt = p.date_time || p.scheduled_date_time || p.created_at || '';
     const un = (p.social_network_username || p.social_network_name || '').replace('@', '').toLowerCase();
@@ -207,15 +212,26 @@ function countScheduledByType(allPosts, username, targetDateStr) {
   });
   const counts = { reels: 0, stories: 0, carousel: 0 };
   todayPosts.forEach(function(p) {
-    const hasVideo = p.video_url && p.video_url !== 'NA';
-    const hasImg   = p.content_image && p.content_image !== 'NA';
+    const pid = p.post_id;
+    // 1. Registry Firebase (source de verite — 100% fiable)
+    if (pid && typeMap[pid] && typeMap[pid].type) {
+      const t = typeMap[pid].type;
+      if (t === 'stories') counts.stories++;
+      else if (t === 'carousel') counts.carousel++;
+      else counts.reels++;
+      return;
+    }
+    // 2. Detection URL — stories dashboard V2 passent par /api/temp-video?id=story_
+    const vurl = p.video_url || '';
+    if (/\/api\/temp-video\?id=story_/.test(vurl)) { counts.stories++; return; }
+    // 3. Heuristique fallback (posts legacy sans registry ni URL story)
+    const hasVideo = vurl && vurl !== 'NA';
     const hasImgs  = p.image_urls && Array.isArray(p.image_urls) && p.image_urls.length > 1;
-    const ig = (function() { try { return JSON.parse(p.instagram_settings || '{}'); } catch (e) { return {}; } })();
-    if (ig.isStory || ig.shareToStory) counts.stories++;
-    else if (hasImgs)              counts.carousel++;
-    else if (hasVideo)             counts.reels++;
-    else if (hasImg && !ig.isReel) counts.stories++;
-    else                           counts.reels++;
+    const hasImg   = p.content_image && p.content_image !== 'NA';
+    if (hasImgs) counts.carousel++;
+    else if (hasVideo) counts.reels++;      // video sans registry = reel par defaut
+    else if (hasImg) counts.carousel++;
+    else counts.reels++;
   });
   return counts;
 }
@@ -432,26 +448,53 @@ module.exports = async function handler(req, res) {
 
     console.log('[cron v3] Caption mode: ' + (captionCfg.enabled ? 'IA Claude Haiku' : 'Template "' + (captionCfg.template || 'vide') + '"'));
 
-    // 2. OAuth Drive + prefetch OneUp en parallèle (une seule fois pour tout le run)
+    // 2. OAuth Drive + prefetch OneUp + registry typeMap en parallèle (une seule fois pour tout le run)
     // En mode CHECKER : aussi fetch published pour exclure ce qui a déjà été publié
+    // typeMap = registry Firebase post_id -> type (source de verite anti-sur-scheduling)
     var oauthToken     = null;
     var allOneupPosts  = [];
+    var typeMap        = {};
     const fetchPubPromise = isChecker
       ? fetch(ONEUP_BASE + '/api/getpublishedposts?start=0&apiKey=' + ONEUP_KEY).then(function(r){ return r.json(); }).then(function(d){ return Array.isArray(d) ? d : (d.data || []); }).catch(function(){ return []; })
       : Promise.resolve([]);
-    const [oauthResult, oneupResult, pubResult] = await Promise.allSettled([
+    const [oauthResult, oneupResult, pubResult, typeMapResult] = await Promise.allSettled([
       Object.keys(driveFolderMap).length > 0 ? getOAuthToken() : Promise.resolve(null),
       fetchAllScheduledPosts(),
-      fetchPubPromise
+      fetchPubPromise,
+      fbGet('zenty/post_type_map').catch(function(){ return {}; })
     ]);
     if (oauthResult.status === 'fulfilled')  oauthToken    = oauthResult.value;
     else console.error('[drive] OAuth failed:', oauthResult.reason && oauthResult.reason.message);
     if (oneupResult.status === 'fulfilled')  allOneupPosts = oneupResult.value;
     else console.error('[oneup] fetchAll failed:', oneupResult.reason && oneupResult.reason.message);
+    if (typeMapResult.status === 'fulfilled' && typeMapResult.value && typeof typeMapResult.value === 'object') {
+      typeMap = typeMapResult.value;
+      console.log('[registry] Loaded ' + Object.keys(typeMap).length + ' post_type entries');
+    }
     // En mode checker, concat les published pour les compter dans countScheduledByType
     if (isChecker && pubResult.status === 'fulfilled' && Array.isArray(pubResult.value)) {
       allOneupPosts = allOneupPosts.concat(pubResult.value);
       console.log('[checker] +' + pubResult.value.length + ' published posts ajoutés au calcul existing');
+    }
+
+    // Mode daily : nettoyer les entrées typeMap > 48h (evite que Firebase explose)
+    if (!isChecker && Object.keys(typeMap).length > 0) {
+      const expiredThreshold = Date.now() - (48 * 3600 * 1000);
+      const toDelete = {};
+      Object.keys(typeMap).forEach(function(pid) {
+        const entry = typeMap[pid];
+        if (entry && entry.ts && entry.ts < expiredThreshold) toDelete[pid] = null;
+      });
+      const delCount = Object.keys(toDelete).length;
+      if (delCount) {
+        try {
+          await fetch(FIREBASE_URL + '/zenty/post_type_map.json' + fbAuth, {
+            method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(toDelete)
+          });
+          console.log('[registry] Cleaned ' + delCount + ' entries > 48h');
+        } catch (e) { /* silent */ }
+      }
     }
 
     const _usedFileIds  = new Set();
@@ -489,7 +532,8 @@ module.exports = async function handler(req, res) {
       }
 
       // Double-check OneUp (filet anti-race-condition) — filtre en mémoire, 0 appel API
-      const existing    = countScheduledByType(allOneupPosts, uname, targetDateStr);
+      // typeMap = registry Firebase (source de verite post_id -> type)
+      const existing    = countScheduledByType(allOneupPosts, uname, targetDateStr, typeMap);
       let needReels   = Math.max(0, (acc.reels   || 0) - existing.reels);
       let needStories = Math.max(0, (acc.stories || 0) - existing.stories);
       let needFeed    = Math.max(0, (acc.feed    || 0) - existing.carousel);
@@ -662,6 +706,18 @@ module.exports = async function handler(req, res) {
           if (result.ok) {
             scheduledTotal++;
             accountResults[item.snId].scheduled++;
+            // Registry Firebase — anti-sur-scheduling (post_id -> type)
+            // CRITIQUE : OneUp getscheduledposts ne renvoie PAS isStory,
+            // donc sans ce registry le checker ne detecte pas les stories
+            // et les re-schedule a chaque run (bug 2026-04-19).
+            if (result.postId) {
+              fbPut('zenty/post_type_map/' + result.postId, {
+                type:  item.type,
+                uname: item.uname,
+                date:  targetDateStr,
+                ts:    Date.now()
+              }).catch(function(){});
+            }
             if (item.toFolder && item.fromFolder && oauthToken) {
               const moved = await moveFileToDrive(oauthToken, item.file.id, item.fromFolder, item.toFolder);
               if (!moved) console.warn('[drive] Move failed: ' + item.file.name + ' @' + item.uname);
