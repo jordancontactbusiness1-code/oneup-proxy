@@ -410,9 +410,20 @@ async function schedulePost(snId, catId, fileId, dateStr, type, fileName, conten
     });
     const d = await r.json();
     if (d && d.error) return { ok: false, postId: null, error: d.message || JSON.stringify(d), convertedFileId: null };
-    const postId = d && (d.post_id || d.id || (d.data && d.data.id) || null);
+    // OneUp schedule endpoints renvoient typiquement {data: {post_id: N}}. On cherche
+    // TOUS les chemins possibles — si postId null malgre le succes, log la reponse brute
+    // pour debug (sans registry le checker re-schedulera en boucle).
+    const postId = d && (
+      d.post_id || d.id ||
+      (d.data && (d.data.post_id || d.data.id)) ||
+      (Array.isArray(d.data) && d.data[0] && (d.data[0].post_id || d.data[0].id)) ||
+      null
+    );
+    if (!postId) {
+      console.warn('[schedulePost] postId not found in response:', JSON.stringify(d).substring(0, 300));
+    }
     // convertedFileId = mp4 généré depuis image (différent de fileId original) → à déplacer aussi vers posted
-    return { ok: true, postId: String(postId || ''), error: null, convertedFileId: actualFileId !== fileId ? actualFileId : null };
+    return { ok: true, postId: postId ? String(postId) : null, error: null, convertedFileId: actualFileId !== fileId ? actualFileId : null };
   } catch (e) {
     return { ok: false, postId: null, error: e.message, convertedFileId: null };
   }
@@ -475,6 +486,41 @@ module.exports = async function handler(req, res) {
     if (isChecker && pubResult.status === 'fulfilled' && Array.isArray(pubResult.value)) {
       allOneupPosts = allOneupPosts.concat(pubResult.value);
       console.log('[checker] +' + pubResult.value.length + ' published posts ajoutés au calcul existing');
+    }
+
+    // BACKFILL registry : tout post OneUp sans entry registry est infere et ecrit.
+    // Protege contre : (1) posts pre-fix, (2) crash du cron avant le fbPut,
+    // (3) posts crees via OneUp UI directement. Sans ce backfill, un post
+    // sans registry serait mal classe par countScheduledByType -> sur-scheduling.
+    const backfillBatch = {};
+    allOneupPosts.forEach(function(p) {
+      const pid = p.post_id;
+      if (!pid || typeMap[pid]) return;
+      const dt = p.date_time || p.scheduled_date_time || '';
+      const uname = (p.social_network_username || p.social_network_name || '').replace('@', '').toLowerCase();
+      const vurl = p.video_url || '';
+      const cimg = p.content_image || '';
+      let inferred = 'reels';
+      if (/\/api\/temp-video\?id=story_/.test(vurl)) inferred = 'stories';
+      else if (!vurl || vurl === 'NA') {
+        if (p.image_urls && Array.isArray(p.image_urls) && p.image_urls.length > 1) inferred = 'carousel';
+        else if (cimg && cimg !== 'NA') inferred = 'carousel';
+      }
+      const entry = { type: inferred, uname: uname, date: dt.substring(0, 10), ts: Date.now(), backfilled: true };
+      typeMap[pid] = entry;
+      backfillBatch[pid] = entry;
+    });
+    const backfillCount = Object.keys(backfillBatch).length;
+    if (backfillCount > 0) {
+      try {
+        await fetch(FIREBASE_URL + '/zenty/post_type_map.json' + fbAuth, {
+          method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(backfillBatch)
+        });
+        console.log('[registry] Backfilled ' + backfillCount + ' entries');
+      } catch (e) {
+        console.error('[registry] Backfill failed:', e.message);
+      }
     }
 
     // Mode daily : nettoyer les entrées typeMap > 48h (evite que Firebase explose)
@@ -706,17 +752,22 @@ module.exports = async function handler(req, res) {
           if (result.ok) {
             scheduledTotal++;
             accountResults[item.snId].scheduled++;
-            // Registry Firebase — anti-sur-scheduling (post_id -> type)
-            // CRITIQUE : OneUp getscheduledposts ne renvoie PAS isStory,
-            // donc sans ce registry le checker ne detecte pas les stories
-            // et les re-schedule a chaque run (bug 2026-04-19).
+            // Registry Firebase AWAIT (pas fire-and-forget) — anti-sur-scheduling.
+            // CRITIQUE : OneUp getscheduledposts ne renvoie PAS isStory, donc
+            // sans ce registry le checker ne detecte pas les stories et les
+            // re-schedule a chaque run (bug 2026-04-19). Await garantit que
+            // l'entree existe AVANT que le checker suivant puisse lire.
             if (result.postId) {
-              fbPut('zenty/post_type_map/' + result.postId, {
-                type:  item.type,
-                uname: item.uname,
-                date:  targetDateStr,
-                ts:    Date.now()
-              }).catch(function(){});
+              try {
+                await fbPut('zenty/post_type_map/' + result.postId, {
+                  type:  item.type,
+                  uname: item.uname,
+                  date:  targetDateStr,
+                  ts:    Date.now()
+                });
+              } catch (e) {
+                console.error('[registry] fbPut failed for ' + result.postId + ':', e.message);
+              }
             }
             if (item.toFolder && item.fromFolder && oauthToken) {
               const moved = await moveFileToDrive(oauthToken, item.file.id, item.fromFolder, item.toFolder);
