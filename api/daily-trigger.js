@@ -198,11 +198,21 @@ async function fetchAllScheduledPosts() {
   return allPosts;
 }
 
-// Filtre en mémoire — pas d'appel API (allPosts déjà chargé)
-// typeMap : registry Firebase post_id -> {type: 'reels'|'stories'|'carousel'}
-// ecrit par cron+dashboard apres chaque schedule. Source de verite — OneUp API
-// getscheduledposts ne renvoie PAS le champ instagram/isStory, donc impossible
-// de distinguer story video vs reel video sans ce registry (bug 2026-04-19).
+// Extrait le Drive fileId d'une URL video_url/content_image OneUp.
+// Formats attendus :
+//   drive-serve?fileId=XXX  (cron VPS — reels, carousel, stories image fallback)
+//   temp-video?id=story_XX  (stories VPS temp — pas de fileId Drive exposé)
+function extractFileId(url) {
+  if (!url || url === 'NA') return null;
+  const m = String(url).match(/fileId=([^&"\s]+)/);
+  return m ? m[1] : null;
+}
+
+// Filtre en mémoire — pas d'appel API (allPosts déjà chargé).
+// typeMap supporte 2 types de cles :
+//   - post_id (ancien) : ne marche plus car OneUp retourne data:[] depuis 2026-04-21
+//   - 'fileid_' + fileId Drive (nouveau) : clé stable, derivable de video_url OneUp
+// URL pattern /api/temp-video?id=story_ = detection directe story (dashboard + cron VPS)
 function countScheduledByType(allPosts, username, targetDateStr, typeMap) {
   typeMap = typeMap || {};
   const todayPosts = allPosts.filter(function(p) {
@@ -212,24 +222,26 @@ function countScheduledByType(allPosts, username, targetDateStr, typeMap) {
   });
   const counts = { reels: 0, stories: 0, carousel: 0 };
   todayPosts.forEach(function(p) {
-    const pid = p.post_id;
-    // 1. Registry Firebase (source de verite — 100% fiable)
-    if (pid && typeMap[pid] && typeMap[pid].type) {
-      const t = typeMap[pid].type;
-      if (t === 'stories') counts.stories++;
-      else if (t === 'carousel') counts.carousel++;
+    // 1. URL pattern temp-video = story certaine (pas besoin de registry)
+    const vurl = p.video_url || '';
+    if (/\/api\/temp-video\?id=story_/.test(vurl)) { counts.stories++; return; }
+    // 2. Registry par fileId Drive (source de verite pour reels/carousel/stories cron)
+    const fileId = extractFileId(vurl) || extractFileId(p.content_image);
+    let entry = null;
+    if (fileId && typeMap['fileid_' + fileId]) entry = typeMap['fileid_' + fileId];
+    else if (p.post_id && typeMap[p.post_id]) entry = typeMap[p.post_id]; // fallback old registry
+    if (entry && entry.type) {
+      if (entry.type === 'stories') counts.stories++;
+      else if (entry.type === 'carousel') counts.carousel++;
       else counts.reels++;
       return;
     }
-    // 2. Detection URL — stories dashboard V2 passent par /api/temp-video?id=story_
-    const vurl = p.video_url || '';
-    if (/\/api\/temp-video\?id=story_/.test(vurl)) { counts.stories++; return; }
-    // 3. Heuristique fallback (posts legacy sans registry ni URL story)
+    // 3. Heuristique fallback (jamais scheduled via nous → rare)
     const hasVideo = vurl && vurl !== 'NA';
     const hasImgs  = p.image_urls && Array.isArray(p.image_urls) && p.image_urls.length > 1;
     const hasImg   = p.content_image && p.content_image !== 'NA';
     if (hasImgs) counts.carousel++;
-    else if (hasVideo) counts.reels++;      // video sans registry = reel par defaut
+    else if (hasVideo) counts.reels++;
     else if (hasImg) counts.carousel++;
     else counts.reels++;
   });
@@ -338,7 +350,10 @@ async function generateCaption(fileId, type, uname, captionCfg, fileName) {
 // - Voir lecon : ZentyBrain/CERVEAU-MERE/08-LEARNINGS/lecon-oneup-image-story-mp4-conversion.md
 // ═══════════════════════════════════════════════════════════════════════════════
 //
-// ── Convertit une image story en mp4 5s via le proxy (cache sur Drive) ────────
+// ── Convertit une image story en mp4 5s via le proxy ──────────────────────────
+// Retourne { fileId, url }. Deux modes :
+//   - fileId set : mp4 cache sur Drive (ancien mode)
+//   - url set   : URL VPS temp-video (mode SA no quota — fix 2026-04-18)
 async function ensureStoryVideo(fileId, parentFolderId) {
   try {
     const r = await fetch('https://dashboard.jscaledashboard.online/api/ensure-story-video', {
@@ -347,8 +362,9 @@ async function ensureStoryVideo(fileId, parentFolderId) {
       body: JSON.stringify({ fileId: fileId, parentFolderId: parentFolderId })
     });
     const d = await r.json();
-    if (d && d.videoFileId) return d.videoFileId;
-    console.warn('[ensureStoryVideo] No videoFileId returned:', JSON.stringify(d));
+    if (d && d.videoFileId) return { fileId: d.videoFileId, url: null };
+    if (d && d.videoUrl)    return { fileId: null, url: d.videoUrl };
+    console.warn('[ensureStoryVideo] No videoFileId/videoUrl returned:', JSON.stringify(d));
     return null;
   } catch (e) {
     console.error('[ensureStoryVideo] Error:', e.message);
@@ -364,20 +380,27 @@ async function schedulePost(snId, catId, fileId, dateStr, type, fileName, conten
   const isCarousel = type === 'carousel';
   let   isImage    = /\.(jpg|jpeg|png|gif|webp)$/i.test(fileName || '');
   let   actualFileId = fileId;
+  let   directUrl    = null; // URL VPS temp-video (SA no quota)
 
-  // Story image -> convertir en mp4 (workaround bug OneUp)
+  // Story image -> convertir en mp4 (workaround bug OneUp feed grid)
+  // JAMAIS fallback scheduleimagepost + isStory:true — toujours aborter si conversion fail
   if (isStory && isImage && storyParentFolderId) {
-    const mp4Id = await ensureStoryVideo(fileId, storyParentFolderId);
-    if (mp4Id) {
-      actualFileId = mp4Id;
+    const conv = await ensureStoryVideo(fileId, storyParentFolderId);
+    if (conv && conv.fileId) {
+      actualFileId = conv.fileId;
       isImage = false;
-      console.log('[story] Image converted to mp4: ' + fileId.substring(0,12) + ' -> ' + mp4Id.substring(0,12));
+      console.log('[story] Converted via Drive mp4: ' + fileId.substring(0,12) + ' -> ' + conv.fileId.substring(0,12));
+    } else if (conv && conv.url) {
+      directUrl = conv.url;
+      isImage = false;
+      console.log('[story] Converted via VPS temp: ' + fileName);
     } else {
-      console.warn('[story] Conversion failed for ' + fileName + ' -> fallback scheduleimagepost (risk: feed grid)');
+      console.warn('[story] Conversion FAILED ' + fileName + ' -> abort (no feed grid fallback)');
+      return { ok: false, postId: null, error: 'story conversion failed', convertedFileId: null };
     }
   }
 
-  const mediaUrl   = 'https://dashboard.jscaledashboard.online/api/drive-serve?fileId=' + actualFileId;
+  const mediaUrl   = directUrl || ('https://dashboard.jscaledashboard.online/api/drive-serve?fileId=' + actualFileId);
   const endpoint   = (isCarousel || (isStory && isImage))
     ? '/api/scheduleimagepost'
     : '/api/schedulevideopost';
@@ -488,27 +511,32 @@ module.exports = async function handler(req, res) {
       console.log('[checker] +' + pubResult.value.length + ' published posts ajoutés au calcul existing');
     }
 
-    // BACKFILL registry : tout post OneUp sans entry registry est infere et ecrit.
-    // Protege contre : (1) posts pre-fix, (2) crash du cron avant le fbPut,
-    // (3) posts crees via OneUp UI directement. Sans ce backfill, un post
-    // sans registry serait mal classe par countScheduledByType -> sur-scheduling.
+    // BACKFILL registry : tout post OneUp sans entry est infere et ecrit.
+    // Clé = 'fileid_' + fileId Drive (extrait de video_url/content_image).
+    // Pour stories VPS temp (pas de fileId), clé = post_id en fallback.
+    // Proteger contre classification erronee : heuristique "image_url set + pas temp-video"
+    // → ambigu (pourrait etre story fallback ou carousel). On classe "reels" par defaut
+    // pour les video_url drive-serve (cas le + frequent).
     const backfillBatch = {};
     allOneupPosts.forEach(function(p) {
-      const pid = p.post_id;
-      if (!pid || typeMap[pid]) return;
-      const dt = p.date_time || p.scheduled_date_time || '';
-      const uname = (p.social_network_username || p.social_network_name || '').replace('@', '').toLowerCase();
       const vurl = p.video_url || '';
       const cimg = p.content_image || '';
-      let inferred = 'reels';
+      const dt = p.date_time || p.scheduled_date_time || '';
+      const uname = (p.social_network_username || p.social_network_name || '').replace('@', '').toLowerCase();
+      const fileId = extractFileId(vurl) || extractFileId(cimg);
+      // Determiner type
+      let inferred;
       if (/\/api\/temp-video\?id=story_/.test(vurl)) inferred = 'stories';
-      else if (!vurl || vurl === 'NA') {
-        if (p.image_urls && Array.isArray(p.image_urls) && p.image_urls.length > 1) inferred = 'carousel';
-        else if (cimg && cimg !== 'NA') inferred = 'carousel';
-      }
+      else if (vurl && vurl !== 'NA') inferred = 'reels'; // video drive-serve = reel
+      else if (p.image_urls && Array.isArray(p.image_urls) && p.image_urls.length > 1) inferred = 'carousel';
+      else if (cimg && cimg !== 'NA') inferred = 'carousel'; // image seule = carousel
+      else inferred = 'reels';
+      // Clé registry : fileId Drive (preferee, stable) ou post_id (fallback pour stories VPS temp)
+      const regKey = fileId ? ('fileid_' + fileId) : (p.post_id ? String(p.post_id) : null);
+      if (!regKey || typeMap[regKey]) return;
       const entry = { type: inferred, uname: uname, date: dt.substring(0, 10), ts: Date.now(), backfilled: true };
-      typeMap[pid] = entry;
-      backfillBatch[pid] = entry;
+      typeMap[regKey] = entry;
+      backfillBatch[regKey] = entry;
     });
     const backfillCount = Object.keys(backfillBatch).length;
     if (backfillCount > 0) {
@@ -598,7 +626,9 @@ module.exports = async function handler(req, res) {
       }
       accountResults[snId] = { uname: uname, scheduled: 0, errors: [] };
 
-      const folders   = driveFolderMap[uname] || {};
+      // Firebase REST interdit les '.' dans les keys, le dashboard ecrit avec sanitize
+      // uname.replace('.', '_'). Lecture : double lookup brut puis sanitize.
+      const folders   = driveFolderMap[uname] || driveFolderMap[uname.replace(/\./g, '_')] || {};
       const carFolder = folders.carousel || folders.feed || null;
 
       // Lister tous les dossiers Drive UNE seule fois en parallèle
@@ -753,21 +783,33 @@ module.exports = async function handler(req, res) {
             scheduledTotal++;
             accountResults[item.snId].scheduled++;
             // Registry Firebase AWAIT (pas fire-and-forget) — anti-sur-scheduling.
-            // CRITIQUE : OneUp getscheduledposts ne renvoie PAS isStory, donc
-            // sans ce registry le checker ne detecte pas les stories et les
-            // re-schedule a chaque run (bug 2026-04-19). Await garantit que
-            // l'entree existe AVANT que le checker suivant puisse lire.
-            if (result.postId) {
-              try {
-                await fbPut('zenty/post_type_map/' + result.postId, {
-                  type:  item.type,
-                  uname: item.uname,
-                  date:  targetDateStr,
-                  ts:    Date.now()
-                });
-              } catch (e) {
-                console.error('[registry] fbPut failed for ' + result.postId + ':', e.message);
+            // CRITIQUE : OneUp getscheduledposts ne renvoie PAS isStory. Clé principale
+            // = 'fileid_' + Drive fileId (stable). Fallback post_id pour stories
+            // VPS temp (pas de fileId). OneUp a change API 2026-04-21 (data:[] au
+            // lieu de data.post_id) donc on ne peut plus se fier a result.postId seul.
+            const entry = {
+              type:  item.type,
+              uname: item.uname,
+              date:  targetDateStr,
+              ts:    Date.now()
+            };
+            const regFileKey = result.convertedFileId
+              ? 'fileid_' + result.convertedFileId  // mp4 cache Drive
+              : (item.file && item.file.id ? 'fileid_' + item.file.id : null);
+            try {
+              if (regFileKey) {
+                await fbPut('zenty/post_type_map/' + regFileKey, entry);
               }
+              // Pour stories VPS temp (pas de fileId dans l'URL finale), ecrire aussi
+              // l'original fileId Drive comme backup + post_id si fourni.
+              if (item.file && item.file.id && regFileKey !== 'fileid_' + item.file.id) {
+                await fbPut('zenty/post_type_map/fileid_' + item.file.id, entry);
+              }
+              if (result.postId) {
+                await fbPut('zenty/post_type_map/' + result.postId, entry);
+              }
+            } catch (e) {
+              console.error('[registry] fbPut failed:', e.message);
             }
             if (item.toFolder && item.fromFolder && oauthToken) {
               const moved = await moveFileToDrive(oauthToken, item.file.id, item.fromFolder, item.toFolder);
