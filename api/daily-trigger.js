@@ -67,6 +67,22 @@ function isSlotFutureParis(slotTime) {
   return (parseInt(p[0]) * 60 + parseInt(p[1])) >= nowMin;
 }
 
+// Check si un slot complet "YYYY-MM-DD HH:MM" est encore dans le futur Paris (+5min buffer).
+// Règle absolue anti-rafale : on ne schedule JAMAIS dans le passé, OneUp publierait immédiatement.
+function isSlotFutureFullParis(slotDateTime) {
+  if (!/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}$/.test(slotDateTime || '')) return false;
+  const nowParis = new Date(new Date().toLocaleString('en-US', { timeZone: 'Europe/Paris' }));
+  const todayStr = nowParis.getFullYear() + '-' + pad(nowParis.getMonth() + 1) + '-' + pad(nowParis.getDate());
+  const p = slotDateTime.split(' ');
+  const slotDate = p[0];
+  if (slotDate > todayStr) return true;
+  if (slotDate < todayStr) return false;
+  const hm = p[1].split(':');
+  const slotMin = parseInt(hm[0]) * 60 + parseInt(hm[1]);
+  const nowMin  = nowParis.getHours() * 60 + nowParis.getMinutes() + 5;
+  return slotMin >= nowMin;
+}
+
 // Génère un slot horaire dans une fenêtre pour un compte donné.
 // accountIdx étale les comptes uniformément dans la fenêtre (stagger).
 function generateSlot(window, targetParisDateStr, accountIdx, totalAccounts) {
@@ -719,18 +735,59 @@ module.exports = async function handler(req, res) {
 
     console.log('[cron v3] Phase 1 — plan: ' + plan.length + ' post(s) pour ' + totalAccounts + ' compte(s)');
 
-    // ── PHASE 2 : Générer TOUTES les captions en batches parallèles ─────────────
+    // ── PHASE 2a : Calcul des slots EN PREMIER (avant captions) ────────────────
+    // Pourquoi avant : on veut éviter de générer des captions IA (coûteuses en
+    // tokens Anthropic) pour des posts qui seront skippés car slot dans le passé.
+    // ─────────────────────────────────────────────────────────────────────────
+    // Générer les slots horaires : custom Firebase si dispo (fourchette ±25min anti-flag IG, Jordan 2026-04-14), sinon PEAK_WINDOWS
+    plan.forEach(function(item) {
+      if (item.customTime && /^([01]?\d|2[0-3]):[0-5]\d$/.test(item.customTime)) {
+        var parts = item.customTime.split(':');
+        var jitter = Math.floor(Math.random() * 51) - 25; // -25..+25 min (fourchette ~1h anti-flag)
+        var h = parseInt(parts[0]);
+        var m = parseInt(parts[1]) + jitter;
+        if (m < 0) { m += 60; h--; }
+        if (m >= 60) { m -= 60; h++; }
+        if (h < 0) h = 0;
+        if (h > 23) h = 23;
+        item.slot = targetDateStr + ' ' + (h<10?'0':'') + h + ':' + (m<10?'0':'') + m;
+      } else {
+        item.slot = generateSlot(item.window, targetDateStr, item.accountIdx, totalAccounts);
+      }
+    });
+
+    // ── PHASE 2b : GARDE-FOU ANTI-RAFALE ───────────────────────────────────────
+    // Règle absolue (leçon 2026-04-21) : si un slot est dans le passé, OneUp
+    // publie IMMÉDIATEMENT → rafale visible sur IG (ex 50 posts en 8 min).
+    // Cause typique : daily 01h Paris a raté (endpoint down, network), run
+    // manuel plus tard dans la journée → slots matin/midi sont passés.
+    // Comportement : on NE RATTRAPE PAS dans la journée, on laisse le contenu
+    // pour le lendemain. Mieux 1 post à la bonne heure que 5 en rafale.
+    plan.forEach(function(item) {
+      if (!isSlotFutureFullParis(item.slot)) {
+        item.skipPast = true;
+        item.pastReason = '@' + item.uname + ' ' + item.type + ' ' + (item.slot || '?');
+      }
+    });
+    var pastPlannedCount = plan.filter(function(i){ return i.skipPast; }).length;
+    if (pastPlannedCount > 0) {
+      var examples = plan.filter(function(i){return i.skipPast;}).slice(0,5).map(function(i){return i.pastReason;}).join(' | ');
+      console.warn('[cron v3] ⚠️  ' + pastPlannedCount + '/' + plan.length + ' slot(s) dans le PASSÉ — skippés pour éviter rafale OneUp. Exemples: ' + examples);
+    }
+
+    // ── PHASE 2c : Générer les captions UNIQUEMENT pour les posts gardés ───────
     // Batches de 15 pour respecter les rate limits Anthropic (50 RPM Haiku).
     // Stories → template. Reels/Carousel → IA si enabled.
     // Cache Firebase évite les regénérations pour les mêmes fichiers.
     // ─────────────────────────────────────────────────────────────────────────
     const CAPTION_BATCH = 15; // max appels Anthropic simultanés
-    if (plan.length > 0) {
+    const futurePlan    = plan.filter(function(i){ return !i.skipPast; });
+    if (futurePlan.length > 0) {
       if (captionCfg.enabled && ANTHROPIC_KEY) {
-        const aiCount = plan.filter(function(i) { return i.type !== 'stories'; }).length;
+        const aiCount = futurePlan.filter(function(i) { return i.type !== 'stories'; }).length;
         console.log('[caption] Génération de ' + aiCount + ' caption(s) IA — batches de ' + CAPTION_BATCH + '...');
-        for (var ci2 = 0; ci2 < plan.length; ci2 += CAPTION_BATCH) {
-          const batch = plan.slice(ci2, ci2 + CAPTION_BATCH);
+        for (var ci2 = 0; ci2 < futurePlan.length; ci2 += CAPTION_BATCH) {
+          const batch = futurePlan.slice(ci2, ci2 + CAPTION_BATCH);
           await Promise.all(
             batch.map(function(item) {
               return generateCaption(item.file.id, item.type, item.uname, captionCfg, item.file.name)
@@ -740,26 +797,9 @@ module.exports = async function handler(req, res) {
         }
         console.log('[caption] Toutes les captions prêtes.');
       } else {
-        plan.forEach(function(item) { item.caption = captionCfg.template || ''; });
+        futurePlan.forEach(function(item) { item.caption = captionCfg.template || ''; });
         if (captionCfg.template) console.log('[caption] Mode template — "' + captionCfg.template + '"');
       }
-
-      // Générer les slots horaires : custom Firebase si dispo (fourchette ±25min anti-flag IG, Jordan 2026-04-14), sinon PEAK_WINDOWS
-      plan.forEach(function(item) {
-        if (item.customTime && /^([01]?\d|2[0-3]):[0-5]\d$/.test(item.customTime)) {
-          var parts = item.customTime.split(':');
-          var jitter = Math.floor(Math.random() * 51) - 25; // -25..+25 min (fourchette ~1h anti-flag)
-          var h = parseInt(parts[0]);
-          var m = parseInt(parts[1]) + jitter;
-          if (m < 0) { m += 60; h--; }
-          if (m >= 60) { m -= 60; h++; }
-          if (h < 0) h = 0;
-          if (h > 23) h = 23;
-          item.slot = targetDateStr + ' ' + (h<10?'0':'') + h + ':' + (m<10?'0':'') + m;
-        } else {
-          item.slot = generateSlot(item.window, targetDateStr, item.accountIdx, totalAccounts);
-        }
-      });
     }
 
     // ── PHASE 3 : Scheduler sur OneUp + déplacer les fichiers Drive ──────────
@@ -769,11 +809,18 @@ module.exports = async function handler(req, res) {
     const SCHEDULE_BATCH = 10;
     var   scheduledTotal = 0;
     var   failedTotal    = 0;
+    var   pastSkippedTotal = 0;
 
     for (var pi = 0; pi < plan.length; pi += SCHEDULE_BATCH) {
       const batch = plan.slice(pi, pi + SCHEDULE_BATCH);
       await Promise.all(
         batch.map(async function(item) {
+          // Anti-rafale : slot passé → skip (jamais envoyé à OneUp, qui publierait immédiatement).
+          if (item.skipPast) {
+            pastSkippedTotal++;
+            accountResults[item.snId].errors.push(item.type + ': slot passé (' + item.slot + ') — skip anti-rafale');
+            return;
+          }
           const result = await schedulePost(
             item.snId, item.acc.category_id, item.file.id,
             item.slot, item.type, item.file.name, item.caption,
@@ -827,7 +874,7 @@ module.exports = async function handler(req, res) {
       );
     }
 
-    console.log('[cron v3] Phase 3 — ' + scheduledTotal + ' schedulés, ' + failedTotal + ' échoués');
+    console.log('[cron v3] Phase 3 — ' + scheduledTotal + ' schedulés, ' + failedTotal + ' échoués, ' + pastSkippedTotal + ' slots passés skippés');
 
     // ── Rapport Telegram ──────────────────────────────────────────────────────
     const results = [];
@@ -844,15 +891,18 @@ module.exports = async function handler(req, res) {
     skippedReasons.forEach(function(r) { results.push(r); });
 
     const dur         = ((Date.now() - startTime) / 1000).toFixed(1);
-    const emoji       = failedTotal > 0 ? '⚠️' : '⚡';
+    const emoji       = (failedTotal > 0 || pastSkippedTotal > 0) ? '⚠️' : '⚡';
     const captionMode = captionCfg.enabled ? '✨ Claude IA' : '📝 Template';
     const titlePrefix = isChecker ? '🔧 *Zenty Checker (auto-fix)*' : (emoji + ' *Zenty Daily Scheduler v3*');
     const lines       = [
       titlePrefix + ' — ' + targetDateStr,
       '',
-      '📊 ' + totalAccounts + ' comptes | ' + scheduledTotal + ' programmés | ' + skippedCount + ' déjà OK | ' + failedTotal + ' erreur(s)',
+      '📊 ' + totalAccounts + ' comptes | ' + scheduledTotal + ' programmés | ' + skippedCount + ' déjà OK | ' + failedTotal + ' erreur(s)' + (pastSkippedTotal > 0 ? ' | ' + pastSkippedTotal + ' slots passés skippés' : ''),
       '🖊️ Captions: ' + captionMode
     ];
+    if (pastSkippedTotal > 0 && !isChecker) {
+      lines.push('', '🚨 *ALERTE RAFALE ÉVITÉE* : ' + pastSkippedTotal + ' slot(s) dans le passé — probablement daily 01h raté. Vérifier logs /opt/zenty-cron/logs/cron.log. Posts NON rattrapés (évite publication immédiate en rafale).');
+    }
     if (results.length) lines.push('', results.join('\n'));
     lines.push('\n⏱ ' + dur + 's');
     // Mode CHECKER : Telegram silent si rien à corriger (évite spam toutes les 30min)
@@ -863,13 +913,14 @@ module.exports = async function handler(req, res) {
     }
 
     res.status(200).json({
-      ok:          true,
-      scheduled:   scheduledTotal,
-      skipped:     skippedCount,
-      failed:      failedTotal,
-      date:        targetDateStr,
-      accounts:    totalAccounts,
-      captionMode: captionMode
+      ok:             true,
+      scheduled:      scheduledTotal,
+      skipped:        skippedCount,
+      failed:         failedTotal,
+      pastSkipped:    pastSkippedTotal,
+      date:           targetDateStr,
+      accounts:       totalAccounts,
+      captionMode:    captionMode
     });
 
   } catch (e) {
