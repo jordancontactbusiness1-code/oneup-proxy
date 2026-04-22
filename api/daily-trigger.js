@@ -271,7 +271,9 @@ function countScheduledByType(allPosts, username, targetDateStr, typeMap) {
 //   IA OFF   → template pour tous
 //   IA ON    → cache Firebase → Anthropic → fallback template
 //
-// Cache : zenty/captions_cache/{fileId_sanitized}
+// Cache : zenty/captions_cache/{fileId_sanitized}__{uname_sanitized}
+//   CLÉ PAR COMPTE — sinon même reel partagé entre comptes = même caption
+//   = patron suspect Instagram (flag, reach baissé). Fix 2026-04-22.
 // Modèle : claude-haiku-4-5-20251001 (rapide, économique, ~1-2s)
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -328,8 +330,11 @@ async function generateCaption(fileId, type, uname, captionCfg, fileName) {
   // IA désactivée ou pas de clé
   if (!captionCfg || !captionCfg.enabled || !ANTHROPIC_KEY) return template;
 
-  // Cache Firebase — évite les regénérations pour le même fichier
-  const cacheKey = 'zenty/captions_cache/' + fileId.replace(/[^a-zA-Z0-9]/g, '_');
+  // Cache Firebase — clé par (fileId, uname) pour éviter caption identique
+  // si le même reel passe sur 2 comptes (= flag Instagram garanti).
+  const sanitizedFileId = fileId.replace(/[^a-zA-Z0-9]/g, '_');
+  const sanitizedUname  = (uname || 'unknown').replace(/[^a-zA-Z0-9]/g, '_');
+  const cacheKey = 'zenty/captions_cache/' + sanitizedFileId + '__' + sanitizedUname;
   try {
     const cached = await fbGet(cacheKey);
     if (cached && cached.text) {
