@@ -65,7 +65,21 @@ PIÈGES RÉCURRENTS DOCUMENTÉS :
 - Cron daily-trigger 21/04 : 50 posts en 8 min car slot dans le passé (isSlotFutureFullParis)
 
 TON RÔLE :
-Diagnostiquer un incident. Output STRICTEMENT JSON, RIEN D'AUTRE (pas de markdown, pas de prose) :
+Diagnostiquer un incident. Output STRICTEMENT JSON, RIEN D'AUTRE (pas de markdown, pas de prose).
+
+⚠️ RÈGLE ANTI-HALLUCINATION CRITIQUE (apprise 2026-05-02 nuit) :
+- NE JAMAIS affirmer qu'une donnée Firebase, fichier, ou config "manque" SANS preuve directe dans les logs ou le signal fourni.
+- Si tu ne sais pas : type="investigation_needed", description="vérifier [X précis]", confidence basse.
+- Cas concrets à éviter : ne pas dire "driveFolderMap manquant", "config X absente", "fichier Y supprimé" sans qu'un log ou un champ du signal le PROUVE explicitement.
+- Tu n'as accès QU'AU signal et logs fournis. Tu ne peux pas lire Firebase ni le code. Tout ce qui n'est pas dans ton input = INCONNU.
+
+⚠️ INTERPRÉTATION DES SIGNALS POSTING (apprise 2026-05-02 nuit) :
+- Si le signal contient oneupReason="ERROR | aucun média uploadé (NA)" → cause AMONT : le post a été envoyé à OneUp sans image/vidéo. Causes probables : (a) conversion mp4 stories échouée, (b) fileId Drive invalide ou supprimé, (c) ancienne version du code daily-trigger qui ne setait pas image_url. PAS un problème de mapping Firebase aval.
+- Si le signal contient contentType="stories" mais le rollback dit "No driveFolderMap entry" → ne PAS conclure que le mapping manque. Le verify a probablement loadé Firebase à un moment où la donnée n'était pas dispo (timeout, stale fetch). C'est une race condition, pas un vrai missing.
+- Si details.registryType (post_type_map) diffère de details.contentType (inféré) : c'est une INCOHERENCE de classification, pas une cause de fail. Trust le registry.
+- Si l'incident est récurrent (même signature 3+ fois en quelques jours) : cause STRUCTURELLE (config oubliée à l'ajout du compte, code qui ne sett pas un champ obligatoire). Sinon : cause TRANSIENTE (réseau, OneUp transient, etc.).
+
+OUTPUT JSON :
 {
   "cause": "phrase courte concrète (français)",
   "confidence": 0.0-1.0,
@@ -166,10 +180,13 @@ async function gatherIncidents() {
     });
   }
 
-  // 2. Posting failures (today)
+  // 2. Posting failures (today) — enrichis avec post_type_map (source de vérité interne)
   const verifyResults = await fbGet('zenty/post_verify_results/' + today).catch(function() { return null; });
   if (verifyResults && Array.isArray(verifyResults.failed)) {
+    // Pré-fetch post_type_map en bulk pour tous les postIds (1 appel Firebase au lieu de N)
+    const postTypeMap = await fbGet('zenty/post_type_map').catch(function() { return null; }) || {};
     verifyResults.failed.forEach(function(f) {
+      const registry = (f.postId && postTypeMap[f.postId]) || null;
       incidents.push({
         id: 'post-' + (f.postId || '?'),
         category: 'posting',
@@ -177,7 +194,16 @@ async function gatherIncidents() {
         errorHint: f.oneupReason || f.reason || 'unknown',
         source: 'verify',
         timestamp: f.failedAt || now.toISOString(),
-        details: { reason: f.reason, oneupReason: f.oneupReason, rollback: f.rollback }
+        details: {
+          reason: f.reason,
+          oneupReason: f.oneupReason,
+          rollback: f.rollback,
+          fileId: f.fileId || null,
+          // Registry interne (vérité interne, indépendant de l'inférence verify)
+          registryType: registry ? registry.type : null,
+          registryUname: registry ? registry.uname : null,
+          registryBackfilled: registry ? !!registry.backfilled : false
+        }
       });
     });
   }
