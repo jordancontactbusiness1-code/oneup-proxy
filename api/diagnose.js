@@ -34,7 +34,7 @@ const FIREBASE_SECRET = process.env.FIREBASE_SECRET   || '';
 const CRON_SECRET     = process.env.CRON_SECRET       || '';
 const ANTHROPIC_KEY   = process.env.ANTHROPIC_API_KEY || '';
 
-const MAX_INCIDENTS_PER_DAY = 10;     // hard cap budget Anthropic (~5€/mois max)
+const MAX_INCIDENTS_PER_DAY = 30;     // hard cap budget Anthropic (~3€/mois — Jordan a relevé le cap global à 10$/mois 2026-05-02)
 const DEDUP_WINDOW_MS       = 24 * 60 * 60 * 1000;
 const MODEL                 = 'claude-haiku-4-5-20251001';
 
