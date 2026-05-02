@@ -257,6 +257,78 @@ async function checkMultiAgencyOrphans() {
   };
 }
 
+// ── Check 6a: Posting schedule compliance — chaque compte a posté le bon nb ──
+// Détection des stories/reels MANQUANTS et DOUBLONS par compte aujourd'hui.
+// Bug du 2026-05-02 : 4/5 comptes n'ont pas posté leur story 13:30 (storyParentFolderId
+// orphelin) ET tous ont eu doublons à 21:00 (re-schedule checker). Aucun check ne
+// détectait ça → cette fonction l'aurait alerté immédiatement.
+async function checkPostingScheduleCompliance() {
+  if (!ONEUP_KEY) return { name: 'posting_schedule_compliance', ok: true, note: 'no key (skipped)' };
+  try {
+    // 1. Lire la config de tous les comptes actifs
+    const accounts = await fbGet('zenty/cron_config/accounts').catch(function() { return null; }) || {};
+    const expectedByAccount = {};
+    Object.keys(accounts).forEach(function(snid) {
+      const a = accounts[snid];
+      if (!a || a.paused === true || !a.username) return;
+      const handle = (a.username || '').replace('@', '').toLowerCase();
+      const reelsExpected = a.reels || 0;
+      const storiesExpected = a.stories || 0;
+      if (reelsExpected + storiesExpected === 0) return;
+      expectedByAccount[handle] = {
+        reels: reelsExpected,
+        stories: storiesExpected,
+        total: reelsExpected + storiesExpected
+      };
+    });
+    // 2. Compter les posts publiés aujourd'hui par compte
+    const r = await fetch('https://www.oneupapp.io/api/getpublishedposts?apiKey=' + ONEUP_KEY);
+    if (!r.ok) return { name: 'posting_schedule_compliance', ok: false, error: 'HTTP ' + r.status };
+    const txt = await r.text();
+    if (txt.trim().startsWith('<')) return { name: 'posting_schedule_compliance', ok: false, error: 'OneUp HTML' };
+    const j = JSON.parse(txt);
+    const arr = Array.isArray(j) ? j : (j.data || []);
+    const today = new Date().toISOString().split('T')[0];
+    const publishedByAccount = {};
+    arr.filter(function(p) { return (p.created_at || '').startsWith(today); }).forEach(function(p) {
+      const h = (p.social_network_username || '').toLowerCase();
+      if (!publishedByAccount[h]) publishedByAccount[h] = 0;
+      publishedByAccount[h]++;
+    });
+    // 3. Tolérer "trop tôt dans la journée" (avant 22h Paris = 20h UTC, certains slots
+    //    ne sont pas encore passés). Hard-check seulement après 22h Paris.
+    const hourUTC = new Date().getUTCHours();
+    const tooEarly = hourUTC < 20;
+    // 4. Détecter MISSING (publié < attendu) et OVER (publié > attendu)
+    const missing = [];
+    const over = [];
+    Object.keys(expectedByAccount).forEach(function(handle) {
+      const exp = expectedByAccount[handle];
+      const got = publishedByAccount[handle] || 0;
+      if (got < exp.total && !tooEarly) {
+        missing.push({ handle: handle, expected: exp.total, got: got, deficit: exp.total - got });
+      }
+      if (got > exp.total) {
+        over.push({ handle: handle, expected: exp.total, got: got, surplus: got - exp.total });
+      }
+    });
+    return {
+      name: 'posting_schedule_compliance',
+      ok: missing.length === 0 && over.length === 0,
+      tooEarlyForMissingCheck: tooEarly,
+      missingCount: missing.length,
+      overCount: over.length,
+      missing: missing.slice(0, 10),
+      over: over.slice(0, 10),
+      note: (missing.length > 0 ? missing.length + ' compte(s) ont posté MOINS que prévu' : '') +
+            (over.length > 0 ? (missing.length > 0 ? ' · ' : '') + over.length + ' compte(s) ont posté PLUS (doublons)' : '') ||
+            'tous les comptes ont posté le bon nombre'
+    };
+  } catch (e) {
+    return { name: 'posting_schedule_compliance', ok: false, error: e.message };
+  }
+}
+
 // ── Check 6b: Posting rate limit — détecter rafale (posts trop rapprochés) ──
 // Lit OneUp getpublishedposts today et calcule l'intervalle entre posts pour chaque compte.
 // Alerte si un compte a 2+ posts publiés en < 30 min (rafale anormale).
@@ -433,6 +505,7 @@ module.exports = async function handler(req, res) {
     checkAccountConfigIntegrity(),
     checkDriveFolderMapIntegrity(),
     checkPostingFlow(),
+    checkPostingScheduleCompliance(),
     checkPostingRateLimit(),
     checkCaptionAIHealth(),
     checkCronTimers(),
