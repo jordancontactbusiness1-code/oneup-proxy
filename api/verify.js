@@ -160,23 +160,29 @@ module.exports = async function handler(req, res) {
       // Considère seulement les posts du jour (filtre date Paris)
       if (!dt.startsWith(todayStr)) continue;
       const uname = (p.social_network_username || p.social_network_name || '').replace('@', '').toLowerCase();
-      // Récup type + fileId via registry post_type_map
-      let type = 'reels', fileId = null;
-      // Cherche entry registry par post_id (clé peut être 'pid' ou 'fileid_xxx')
-      if (postTypeMap[pid]) { type = postTypeMap[pid].type || 'reels'; fileId = postTypeMap[pid].fileId || null; }
+      // Récup type + fileId via registry post_type_map (SOURCE DE VÉRITÉ interne)
+      let type = 'reels', fileId = null, typeFromRegistry = false;
+      if (postTypeMap[pid]) {
+        type = postTypeMap[pid].type || 'reels';
+        fileId = postTypeMap[pid].fileId || null;
+        typeFromRegistry = true;
+      }
       // Sinon inférence URL (pattern fileId Drive dans video_url)
       if (!fileId) {
         const url = (p.video_url || '') + ' ' + (p.content_image || '');
         const m = url.match(/fileId=([a-zA-Z0-9_-]{20,})/);
         if (m) fileId = m[1];
       }
-      // Inférence type : video → reels (default) ou stories (instagram.isStory), image → carousel ou stories
-      try {
-        const ig = typeof p.instagram === 'string' ? JSON.parse(p.instagram) : (p.instagram || {});
-        if (ig.isStory) type = 'stories';
-        else if (ig.isReel) type = 'reels';
-        else if ((p.content_image || p.image_url) && !p.video_url) type = 'carousel';
-      } catch(e) {}
+      // Inférence type UNIQUEMENT si pas dans registry — sinon registry prime (évite mismatch
+      // ex : story qui rate sans média se retrouvait classée 'carousel' à cause du fallback)
+      if (!typeFromRegistry) {
+        try {
+          const ig = typeof p.instagram === 'string' ? JSON.parse(p.instagram) : (p.instagram || {});
+          if (ig.isStory) type = 'stories';
+          else if (ig.isReel) type = 'reels';
+          else if ((p.content_image || p.image_url) && !p.video_url) type = 'carousel';
+        } catch(e) {}
+      }
       // Ajouter à la queue (sera processed dans la même run)
       queue[pid] = {
         postId: pid, fileId: fileId, account: uname,
@@ -300,13 +306,17 @@ module.exports = async function handler(req, res) {
           rollbackMsg = 'No driveFolderMap entry for @' + accName;
         }
 
-        // Enrichir avec la raison OneUp si disponible (error_message, message, failure_reason, status)
-        // Permet d'afficher la cause exacte dans le Telegram alert (ex : "Authentication failed", "Aspect ratio invalid")
+        // Enrichir avec la raison OneUp si disponible. La VRAIE clé OneUp est `fail_reason`
+        // (les autres sont des hypothèses qui ne sont pas dans la réponse réelle de OneUp API).
         let oneupReason = '';
         if (isOneupFailed && failedById[postId]) {
           const f = failedById[postId];
-          oneupReason = f.error_message || f.message || f.failure_reason || f.status_message || f.error || '';
+          oneupReason = f.fail_reason || f.error_message || f.message || f.failure_reason || f.status_message || f.error || '';
           if (typeof oneupReason !== 'string') { try { oneupReason = JSON.stringify(oneupReason); } catch(e) { oneupReason = ''; } }
+          // Si content_image=NA et source_url=NA → poste arrivé sans média (cause profonde, à logger)
+          if ((f.content_image === 'NA' || !f.content_image) && (f.source_url === 'NA' || !f.source_url)) {
+            oneupReason = (oneupReason || 'ERROR') + ' | aucun média uploadé (NA)';
+          }
         }
 
         const failedEntry = {
