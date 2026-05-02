@@ -550,8 +550,12 @@ module.exports = async function handler(req, res) {
     const accounts       = cronConfig.accounts       || {};
     const driveFolderMap = cronConfig.driveFolderMap || {};
     const captionCfg     = cronConfig.captionConfig  || { enabled: false, template: '' };
+    // FIX 2026-05-02 nuit : variable manquante qui faisait crasher le checker à
+    // chaque run (ligne 1020 référençait captionMode non déclaré → ReferenceError →
+    // catch → Telegram alert → spam toutes les 15 min).
+    const captionMode    = captionCfg.enabled ? '✨ Claude IA' : '📝 Template';
 
-    console.log('[cron v3] Caption mode: ' + (captionCfg.enabled ? 'IA Claude Haiku' : 'Template "' + (captionCfg.template || 'vide') + '"'));
+    console.log('[cron v3] Caption mode: ' + captionMode);
 
     // 2. OAuth Drive + prefetch OneUp + registry typeMap en parallèle (une seule fois pour tout le run)
     // En mode CHECKER : aussi fetch published pour exclure ce qui a déjà été publié

@@ -229,10 +229,14 @@ module.exports = async function handler(req, res) {
     const incidentsRaw = await fbGet('zenty/incidents').catch(function() { return null; });
     const incidents = (incidentsRaw && typeof incidentsRaw === 'object') ? incidentsRaw : {};
 
-    // Trier par timestamp asc, garder les 'open' uniquement
+    // Trier par timestamp asc. Garder :
+    //  - status 'open' (auto_safe whitelist exécuté direct)
+    //  - status 'user_approved' (Jordan a validé via Telegram boutons — Vague 4A)
     const openIds = Object.keys(incidents).filter(function(id) {
       const i = incidents[id];
-      return i && i.diagnosis && (!i.status || i.status === 'open');
+      if (!i || !i.diagnosis) return false;
+      const s = i.status || 'open';
+      return s === 'open' || s === 'user_approved';
     }).sort(function(a, b) {
       return new Date(incidents[a].timestamp).getTime() - new Date(incidents[b].timestamp).getTime();
     });
@@ -248,9 +252,12 @@ module.exports = async function handler(req, res) {
       const incident = incidents[incidentId];
       const dx = incident.diagnosis;
       const fix = dx.proposedFix || {};
+      const isUserApproved = incident.status === 'user_approved';
 
-      // Cas 1 : auto_safe — exécuter si action whitelistée
-      if (fix.type === 'auto_safe' && fix.action && fix.action.name && WHITELIST[fix.action.name]) {
+      // Cas 1 : auto_safe (whitelist) OU user_approved avec action whitelistée (Vague 4A)
+      // Si Jordan a validé via Telegram bouton, on exécute aussi les config_change
+      // tant que l'action est dans la whitelist (sync_story_parent_folder, etc.).
+      if ((fix.type === 'auto_safe' || isUserApproved) && fix.action && fix.action.name && WHITELIST[fix.action.name]) {
         const wl = WHITELIST[fix.action.name];
         const args = fix.action.args || [];
 

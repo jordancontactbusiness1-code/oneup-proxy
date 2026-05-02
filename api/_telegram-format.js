@@ -34,6 +34,79 @@ async function sendTelegram(text) {
   } catch (e) { return false; }
 }
 
+// ── Send avec boutons inline (Vague 4A interactif) ────────────────────────────
+// buttons = [[{text:'✅ Apply', data:'apply:incidentId'}, ...]]
+// Fallback : si Markdown rejeté (text avec _ * [ non escaped), retry sans parse_mode.
+async function sendTelegramWithButtons(text, buttons) {
+  if (!TG_TOKEN || !TG_CHAT) return false;
+  const inlineKeyboard = (buttons || []).map(function(row) {
+    return row.map(function(b) {
+      return { text: b.text, callback_data: b.data };
+    });
+  });
+  async function trySend(useMarkdown) {
+    const body = {
+      chat_id: TG_CHAT,
+      text: text,
+      disable_web_page_preview: true,
+      reply_markup: { inline_keyboard: inlineKeyboard }
+    };
+    if (useMarkdown) body.parse_mode = 'Markdown';
+    try {
+      const r = await fetch('https://api.telegram.org/bot' + TG_TOKEN + '/sendMessage', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body)
+      });
+      const d = await r.json();
+      return d && d.ok ? true : (d && d.description) || false;
+    } catch (e) { return false; }
+  }
+  // 1er essai avec Markdown
+  let result = await trySend(true);
+  if (result === true) return true;
+  // Fallback : si erreur de parsing markdown, réessayer sans parse_mode
+  if (typeof result === 'string' && /parse|markdown/i.test(result)) {
+    console.warn('[telegram] Markdown rejected (' + result + '), retry plain text');
+    result = await trySend(false);
+    return result === true;
+  }
+  return false;
+}
+
+// ── Format message validation incident (Vague 4A) ─────────────────────────────
+// Compose un message + boutons OUI/NON/VOIR pour 1 incident.
+// Format respecte les règles du fichier feedback_telegram_langage_jordan.md
+function formatIncidentValidation(incident, incidentId) {
+  const diag = incident.diagnosis || {};
+  const fix = diag.proposedFix || {};
+  const target = (incident.signal && incident.signal.target) || '?';
+  const userMsg = diag.userMessage || diag.cause || 'incident sans détail';
+  const riskEmoji = diag.riskLevel === 'high' ? '🔴' : (diag.riskLevel === 'medium' ? '🟠' : '🟡');
+  const fixType = fix.type || 'investigation_needed';
+  const fixTypeFr = {
+    'auto_safe': 'action safe',
+    'config_change': 'modif config',
+    'code_patch': 'modif code',
+    'investigation_needed': 'à investiguer',
+    'user_action': 'action manuelle'
+  }[fixType] || fixType;
+  const text = '🔧 *Bug détecté — fix proposé* ' + riskEmoji + '\n\n' +
+    '*Cible :* `' + target + '`\n' +
+    '*Souci :* ' + userMsg + '\n\n' +
+    '*Ma proposition :* ' + (fix.description || '?') + '\n' +
+    '*Type :* ' + fixTypeFr + ' — *Risque :* ' + (diag.riskLevel || '?') + '\n\n' +
+    '*Rollback si besoin :* ' + (fix.rollback || 'rollback automatique via backup') + '\n\n' +
+    'Tu valides ?';
+  const buttons = [[
+    { text: '✅ OUI applique', data: 'apply:' + incidentId },
+    { text: '❌ NON attends', data: 'reject:' + incidentId }
+  ], [
+    { text: '👀 Voir détail', data: 'view:' + incidentId }
+  ]];
+  return { text: text, buttons: buttons };
+}
+
 // ── Formatters de date ────────────────────────────────────────────────────────
 const MONTHS_FR = ['janv.', 'févr.', 'mars', 'avril', 'mai', 'juin', 'juil.', 'août', 'sept.', 'oct.', 'nov.', 'déc.'];
 function fmtDate(yyyymmdd) {
@@ -323,6 +396,8 @@ function formatFatalError(serviceName, errorMsg) {
 
 module.exports = {
   sendTelegram: sendTelegram,
+  sendTelegramWithButtons: sendTelegramWithButtons,
+  formatIncidentValidation: formatIncidentValidation,
   // Formatters
   formatFailAlert:      formatFailAlert,
   formatDigestMorning:  formatDigestMorning,
