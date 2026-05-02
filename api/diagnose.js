@@ -180,6 +180,28 @@ async function gatherIncidents() {
     });
   }
 
+  // 1.b Integrity checks failures (last 2 hours UTC) — données structurelles cassées
+  const integrityChecks = await fbGet('zenty/integrity_checks/' + today).catch(function() { return null; });
+  if (integrityChecks && typeof integrityChecks === 'object') {
+    const hours = Object.keys(integrityChecks).sort().slice(-2);
+    hours.forEach(function(hour) {
+      const ic = integrityChecks[hour];
+      if (ic && ic.allOk === false && Array.isArray(ic.checks)) {
+        ic.checks.filter(function(c) { return !c.ok; }).forEach(function(failed) {
+          incidents.push({
+            id: 'integrity-' + today + '-' + hour + '-' + failed.name,
+            category: 'data_integrity',
+            target: failed.name,
+            errorHint: 'integrity_violation:' + failed.name,
+            source: 'integrity',
+            timestamp: ic.timestamp || now.toISOString(),
+            details: failed
+          });
+        });
+      }
+    });
+  }
+
   // 2. Posting failures (today) — enrichis avec post_type_map (source de vérité interne)
   const verifyResults = await fbGet('zenty/post_verify_results/' + today).catch(function() { return null; });
   if (verifyResults && Array.isArray(verifyResults.failed)) {

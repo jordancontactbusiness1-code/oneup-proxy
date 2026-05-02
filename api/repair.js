@@ -161,6 +161,54 @@ const WHITELIST = {
       return { ok: true, output: r.stdout + r.stderr };
     },
     module: 'system'
+  },
+
+  // Sync storyParentFolderId pour un compte depuis driveFolderMap
+  // (ajouté 2026-05-02 nuit après bug 12 comptes orphelins)
+  'sync_story_parent_folder': {
+    validate: function(args) {
+      const snid = args && args[0];
+      return typeof snid === 'string' && /^\d{15,20}$/.test(snid);
+    },
+    execute: async function(args) {
+      const snid = args[0];
+      // Lire le compte
+      const account = await fbGet('zenty/cron_config/accounts/' + snid);
+      if (!account || !account.username) throw new Error('account ' + snid + ' not found');
+      const handle = (account.username || '').replace('@', '').toLowerCase();
+      const handleSafe = handle.replace(/\./g, '_');
+      // Lire le driveFolderMap
+      const dfm = await fbGet('zenty/cron_config/driveFolderMap');
+      const entry = (dfm && (dfm[handle] || dfm[handleSafe])) || null;
+      if (!entry || !entry.stories) throw new Error('no driveFolderMap.stories for @' + handle);
+      // Patch ciblé
+      await fbPatch('zenty/cron_config/accounts/' + snid, { storyParentFolderId: entry.stories });
+      return { ok: true, output: 'Set storyParentFolderId=' + entry.stories + ' for @' + handle };
+    },
+    module: 'config_sync'
+  },
+
+  // Cleanup orphelins driveFolderMap (entries sans compte correspondant)
+  'cleanup_orphan_dfm': {
+    validate: function(args) {
+      // handleSafe à supprimer
+      const handleSafe = args && args[0];
+      return typeof handleSafe === 'string' && /^[a-z0-9_]{3,30}$/.test(handleSafe);
+    },
+    execute: async function(args) {
+      const handleSafe = args[0];
+      // Vérifier que c'est bien un orphelin (pas dans accounts)
+      const accounts = await fbGet('zenty/cron_config/accounts');
+      const found = Object.values(accounts || {}).some(function(a) {
+        if (!a || !a.username) return false;
+        const h = (a.username || '').replace('@', '').toLowerCase().replace(/\./g, '_');
+        return h === handleSafe;
+      });
+      if (found) throw new Error('@' + handleSafe + ' is NOT orphan, account exists');
+      await fbDelete('zenty/cron_config/driveFolderMap/' + handleSafe);
+      return { ok: true, output: 'Removed orphan driveFolderMap entry: ' + handleSafe };
+    },
+    module: 'config_sync'
   }
 };
 
