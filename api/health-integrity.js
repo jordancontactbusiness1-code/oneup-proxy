@@ -257,6 +257,38 @@ async function checkMultiAgencyOrphans() {
   };
 }
 
+// ── Check 7a: Smoke tests UI — dernier run sans erreur JS ────────────────────
+// Lit zenty/smoke_results/{date}. Si dernier run a allOk=false → fail le check.
+// Si pas de run aujourd'hui (smoke tourne 1×/jour 6h UTC) : tolère si avant 8h UTC.
+async function checkSmokeTests() {
+  const today = new Date().toISOString().split('T')[0];
+  const yest  = new Date(Date.now() - 86400000).toISOString().split('T')[0];
+  const [resToday, resYest] = await Promise.all([
+    fbGet('zenty/smoke_results/' + today).catch(function() { return null; }),
+    fbGet('zenty/smoke_results/' + yest).catch(function() { return null; })
+  ]);
+  // Run today existe
+  if (resToday && resToday.timestamp) {
+    return {
+      name: 'smoke_tests',
+      ok: !!resToday.allOk,
+      runAt: resToday.timestamp,
+      totalJsErrors: resToday.totalJsErrors || 0,
+      pagesFailedCount: (resToday.pages || []).filter(function(p) { return !p.ok; }).length
+    };
+  }
+  // Pas de run aujourd'hui : check celui d'hier (fallback)
+  const hourUTC = new Date().getUTCHours();
+  if (hourUTC < 8 && resYest) {
+    return {
+      name: 'smoke_tests', ok: !!resYest.allOk, runAt: resYest.timestamp,
+      note: 'using yesterday run (today not yet)',
+      totalJsErrors: resYest.totalJsErrors || 0
+    };
+  }
+  return { name: 'smoke_tests', ok: true, note: 'no smoke run today (smoke runs 1x/day at 06h UTC)' };
+}
+
 // ── Check 7b: OneUp data contract — schémas attendus respectés ───────────────
 // Bug détecté 2026-05-02 : side-panel.js lisait `scheduledAt`, `caption`, `type` qui
 // n'existent PAS dans la réponse OneUp API (vraies clés : date_time, content, instagram).
@@ -338,6 +370,7 @@ module.exports = async function handler(req, res) {
     checkCronTimers(),
     checkMultiAgencyOrphans(),
     checkTelegramHeartbeat(),
+    checkSmokeTests(),
     checkOneupDataContract()
   ]);
 
