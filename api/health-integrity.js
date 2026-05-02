@@ -473,6 +473,89 @@ async function checkOneupDataContract() {
   }
 }
 
+// ── Check 6d: Anomaly detection (Vague 4C — baseline 7j vs courant) ─────────
+// Compare métriques aujourd'hui vs moyenne+stddev des 7 derniers jours.
+// Alerte si écart > 3× stddev (= pattern anormal). Évite les faux positifs en
+// ne calculant que sur métriques avec sample >= 4 jours et stddev > 0.
+async function checkAnomalyDetection() {
+  try {
+    // Récupérer les 8 derniers jours (7 baseline + aujourd'hui)
+    const dates = [];
+    for (let i = 0; i <= 7; i++) {
+      dates.push(new Date(Date.now() - i * 86400000).toISOString().split('T')[0]);
+    }
+    const today = dates[0];
+
+    // Lire post_verify_results et browser_errors_count en parallèle (2 metrics testables)
+    const [verifyData, browserData] = await Promise.all([
+      Promise.all(dates.map(function(d) { return fbGet('zenty/post_verify_results/' + d).catch(function() { return null; }); })),
+      Promise.all(dates.map(function(d) { return fbGet('zenty/browser_errors_count/' + d).catch(function() { return null; }); }))
+    ]);
+
+    function describe(samples) {
+      const valid = samples.filter(function(v) { return typeof v === 'number'; });
+      if (valid.length < 4) return null; // pas assez d'historique
+      const mean = valid.reduce(function(s, v) { return s + v; }, 0) / valid.length;
+      const variance = valid.reduce(function(s, v) { return s + Math.pow(v - mean, 2); }, 0) / valid.length;
+      const stddev = Math.sqrt(variance);
+      return { mean: Math.round(mean * 10) / 10, stddev: Math.round(stddev * 10) / 10, n: valid.length };
+    }
+
+    function isAnomaly(current, stats) {
+      if (!stats || stats.stddev === 0) return false;
+      const deviation = Math.abs(current - stats.mean) / stats.stddev;
+      return deviation > 3;
+    }
+
+    // Metric 1 : posts publiés/jour (verified count)
+    const verifiedCounts = verifyData.map(function(r) {
+      return (r && Array.isArray(r.verified)) ? r.verified.length : null;
+    });
+    const baselineVerified = describe(verifiedCounts.slice(1));  // exclut today
+    const todayVerified = verifiedCounts[0] || 0;
+
+    // Metric 2 : posts ratés/jour (failed count)
+    const failedCounts = verifyData.map(function(r) {
+      return (r && Array.isArray(r.failed)) ? r.failed.length : null;
+    });
+    const baselineFailed = describe(failedCounts.slice(1));
+    const todayFailed = failedCounts[0] || 0;
+
+    // Metric 3 : errors browser/jour
+    const errCounts = browserData.map(function(v) { return typeof v === 'number' ? v : null; });
+    const baselineErrors = describe(errCounts.slice(1));
+    const todayErrors = errCounts[0] || 0;
+
+    const anomalies = [];
+    if (baselineVerified && isAnomaly(todayVerified, baselineVerified)) {
+      anomalies.push({ metric: 'posts_publiés', today: todayVerified, baseline: baselineVerified });
+    }
+    if (baselineFailed && isAnomaly(todayFailed, baselineFailed)) {
+      anomalies.push({ metric: 'posts_ratés', today: todayFailed, baseline: baselineFailed });
+    }
+    if (baselineErrors && isAnomaly(todayErrors, baselineErrors)) {
+      anomalies.push({ metric: 'errors_browser', today: todayErrors, baseline: baselineErrors });
+    }
+
+    return {
+      name: 'anomaly_detection',
+      ok: anomalies.length === 0,
+      anomaliesCount: anomalies.length,
+      anomalies: anomalies,
+      baselines: {
+        posts_publiés: baselineVerified,
+        posts_ratés: baselineFailed,
+        errors_browser: baselineErrors
+      },
+      note: anomalies.length === 0 ?
+        (baselineVerified ? 'patterns normaux (baseline ' + baselineVerified.n + 'j)' : 'pas assez d\'historique pour baseline') :
+        anomalies.length + ' métrique(s) hors norme'
+    };
+  } catch (e) {
+    return { name: 'anomaly_detection', ok: false, error: e.message };
+  }
+}
+
 // ── Check 7: Telegram heartbeat ──────────────────────────────────────────────
 // Lit zenty/telegram_last_sent (timestamp). Si > 24h, alerte.
 // (Pour V1, on ne sett pas encore ce field, donc check passe par défaut.)
@@ -507,6 +590,7 @@ module.exports = async function handler(req, res) {
     checkPostingFlow(),
     checkPostingScheduleCompliance(),
     checkPostingRateLimit(),
+    checkAnomalyDetection(),
     checkCaptionAIHealth(),
     checkCronTimers(),
     checkMultiAgencyOrphans(),
