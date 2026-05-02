@@ -257,6 +257,73 @@ async function checkMultiAgencyOrphans() {
   };
 }
 
+// ── Check 6b: Posting rate limit — détecter rafale (posts trop rapprochés) ──
+// Lit OneUp getpublishedposts today et calcule l'intervalle entre posts pour chaque compte.
+// Alerte si un compte a 2+ posts publiés en < 30 min (rafale anormale).
+// Bug détecté 2026-05-02 : 10 doublons publiés en rafale à cause d'un fetchAllScheduledPosts
+// qui retournait [] silencieusement quand OneUp répondait du HTML.
+async function checkPostingRateLimit() {
+  if (!ONEUP_KEY) return { name: 'posting_rate_limit', ok: true, note: 'no key (skipped)' };
+  try {
+    const r = await fetch('https://www.oneupapp.io/api/getpublishedposts?apiKey=' + ONEUP_KEY);
+    if (!r.ok) return { name: 'posting_rate_limit', ok: false, error: 'HTTP ' + r.status };
+    const txt = await r.text();
+    if (txt.trim().startsWith('<')) return { name: 'posting_rate_limit', ok: false, error: 'OneUp returned HTML' };
+    const j = JSON.parse(txt);
+    const arr = Array.isArray(j) ? j : (j.data || []);
+    const today = new Date().toISOString().split('T')[0];
+    const todayPosts = arr.filter(function(p) { return (p.created_at || '').startsWith(today); });
+    // Group by account
+    const byAcc = {};
+    todayPosts.forEach(function(p) {
+      const u = p.social_network_username || '?';
+      if (!byAcc[u]) byAcc[u] = [];
+      byAcc[u].push(p.created_at);
+    });
+    // Detect violations : 2+ posts < 30 min apart on same account
+    const violations = [];
+    Object.keys(byAcc).forEach(function(u) {
+      const times = byAcc[u].sort();
+      for (let i = 1; i < times.length; i++) {
+        const t1 = new Date(times[i - 1].replace(' ', 'T')).getTime();
+        const t2 = new Date(times[i].replace(' ', 'T')).getTime();
+        const diffMin = Math.round((t2 - t1) / 60000);
+        if (diffMin < 30) {
+          violations.push({ account: u, t1: times[i - 1], t2: times[i], diffMin: diffMin });
+        }
+      }
+    });
+    return {
+      name: 'posting_rate_limit',
+      ok: violations.length === 0,
+      todayPostsTotal: todayPosts.length,
+      violationsCount: violations.length,
+      violations: violations.slice(0, 10),
+      note: violations.length > 0 ? 'RAFALE détectée — ' + violations.length + ' intervalle(s) < 30 min' : null
+    };
+  } catch (e) {
+    return { name: 'posting_rate_limit', ok: false, error: e.message };
+  }
+}
+
+// ── Check 6c: Browser errors rate (capturés par js/core/error-beacon.js) ──
+// Lit zenty/browser_errors_count/{date} : si > 20 errors aujourd'hui = anomalie.
+// Couvre les vrais users (Jordan + VAs), complémentaire au smoke test (factice).
+async function checkBrowserErrorsRate() {
+  const today = new Date().toISOString().split('T')[0];
+  const countRaw = await fbGet('zenty/browser_errors_count/' + today).catch(function() { return 0; });
+  const count = (typeof countRaw === 'number') ? countRaw : 0;
+  // Threshold : 20 errors/jour (avec dedup 10min côté browser, signal vrai cassé)
+  return {
+    name: 'browser_errors_rate',
+    ok: count < 20,
+    count: count,
+    threshold: 20,
+    note: count >= 20 ? '⚠️ ' + count + ' erreurs JS browser aujourd\'hui (seuil 20)' :
+          (count > 0 ? count + ' erreurs (sous seuil)' : 'aucune erreur browser')
+  };
+}
+
 // ── Check 7a: Smoke tests UI — dernier run sans erreur JS ────────────────────
 // Lit zenty/smoke_results/{date}. Si dernier run a allOk=false → fail le check.
 // Si pas de run aujourd'hui (smoke tourne 1×/jour 6h UTC) : tolère si avant 8h UTC.
@@ -366,10 +433,12 @@ module.exports = async function handler(req, res) {
     checkAccountConfigIntegrity(),
     checkDriveFolderMapIntegrity(),
     checkPostingFlow(),
+    checkPostingRateLimit(),
     checkCaptionAIHealth(),
     checkCronTimers(),
     checkMultiAgencyOrphans(),
     checkTelegramHeartbeat(),
+    checkBrowserErrorsRate(),
     checkSmokeTests(),
     checkOneupDataContract()
   ]);

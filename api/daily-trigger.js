@@ -12,6 +12,26 @@
 //             getTodayScheduledByType() comme 2e filet
 //             Anti-doublon cross-compte en mémoire _usedFileIds
 //             Drive listé UNE seule fois par dossier par compte
+//
+//  ⚠️ EXCEPTION RÈGLE 300L (audit 2026-05-02) — fichier 965L
+//  ─────────────────────────────────────────────────────────────────
+//  La règle "max 300L par fichier" du dashboard ne s'applique pas ici.
+//  Justification : ce fichier est le cœur transactionnel du cron prod.
+//  Splitter introduirait un risque énorme (rafale IG, posts manqués,
+//  registry incohérent) pour un bénéfice cosmétique. La structure interne
+//  est claire (PHASE 1/2a/2b/2c/3), le handler unique permet d'avoir une
+//  vue complète de la transaction lors d'un debug.
+//
+//  Si refacto un jour : faire avec /cs-senior-engineer + tests E2E
+//  healthcheck (zenty-e2e.service) + canary sur compte sandbox AVANT prod.
+//  Découpage proposé en cas de refacto :
+//    - daily-helpers.js (pad, parisDateStr, isSlotFuture*, generateSlot)
+//    - daily-firebase.js (fbGet, fbPut, sendTelegram)
+//    - daily-drive.js (OAuth SA + listFolder + moveFile)
+//    - daily-oneup.js (fetchAllScheduled + extractFileId + countByType)
+//    - daily-caption.js (callAnthropic + generateCaption)
+//    - daily-schedule.js (ensureStoryVideo + schedulePost)
+//    - daily-trigger.js (handler orchestrateur uniquement, ~150L)
 // ═══════════════════════════════════════════════════════════════════
 'use strict';
 
@@ -194,19 +214,42 @@ async function moveFileToDrive(token, fileId, fromId, toId) {
 // Récupère TOUS les posts schedulés via pagination (OneUp retourne ~50 par page).
 // Appelé UNE SEULE FOIS au démarrage du cron, résultat partagé entre tous les comptes.
 async function fetchAllScheduledPosts() {
+  // CRITIQUE 2026-05-02 : si l'API OneUp retourne du HTML (502, rate limit, maintenance)
+  // ou plante au 1er fetch, on DOIT throw au lieu de retourner []. Sinon le checker
+  // interprète "[]" comme "aucun post existant" et re-schedule des doublons → rafale.
+  // Bug détecté ce soir : 10 doublons publiés en 30 min sur plusieurs comptes.
   var allPosts = [];
   var start    = 0;
-  var maxPages = 20; // sécurité anti-boucle infinie (20 × 50 = 1000 posts max)
+  var maxPages = 20;
   while (maxPages-- > 0) {
     try {
       const r = await fetch(ONEUP_BASE + '/api/getscheduledposts?start=' + start + '&apiKey=' + ONEUP_KEY);
-      const d = await r.json();
+      // Check HTTP status explicitement (avant tenter parse JSON)
+      if (!r.ok) {
+        throw new Error('HTTP ' + r.status + ' from OneUp getscheduledposts');
+      }
+      const txt = await r.text();
+      // Détecter si OneUp retourne du HTML (cas erreur 502 / Cloudflare / maintenance)
+      // Si on parse comme JSON, on prend "[]" et le checker re-schedule tout = catastrophe.
+      if (txt.trim().startsWith('<')) {
+        throw new Error('OneUp returned HTML instead of JSON (likely 502/rate limit) — first 80 chars: ' + txt.slice(0, 80));
+      }
+      let d;
+      try { d = JSON.parse(txt); }
+      catch (parseErr) { throw new Error('OneUp JSON parse failed: ' + parseErr.message); }
       const page = Array.isArray(d) ? d : (d.data || []);
       allPosts = allPosts.concat(page);
-      if (page.length < 50) break; // plus de pages
+      if (page.length < 50) break;
       start += 50;
     } catch (e) {
       console.error('[oneup] fetchAllScheduledPosts error at start=' + start + ':', e.message);
+      // CAS 1 : 1ère page failed → état OneUp INCONNU. Throw pour que le caller abort.
+      // (avant ce fix : on retournait [] silencieusement → le checker re-schedulait tout)
+      if (start === 0) {
+        throw new Error('FATAL fetchAll start=0 failed: ' + e.message + ' — aborting to prevent re-scheduling duplicates');
+      }
+      // CAS 2 : pages > 0 ont déjà été récupérées → état partiel mais le 1er bloc OK.
+      // On break et retourne ce qu'on a (mode dégradé, à risque mais beaucoup moins critique).
       break;
     }
   }
@@ -404,7 +447,7 @@ async function schedulePost(snId, catId, fileId, dateStr, type, fileName, conten
   let   directUrl    = null; // URL VPS temp-video (SA no quota)
 
   // Story image -> convertir en mp4 (workaround bug OneUp feed grid)
-  // JAMAIS fallback scheduleimagepost + isStory:true — toujours aborter si conversion fail
+  // RÈGLE ABSOLUE : JAMAIS fallback schedule image post avec isStory:true — toujours aborter si conversion fail
   if (isStory && isImage && storyParentFolderId) {
     const conv = await ensureStoryVideo(fileId, storyParentFolderId);
     if (conv && conv.fileId) {
@@ -419,10 +462,17 @@ async function schedulePost(snId, catId, fileId, dateStr, type, fileName, conten
       console.warn('[story] Conversion FAILED ' + fileName + ' -> abort (no feed grid fallback)');
       return { ok: false, postId: null, error: 'story conversion failed', convertedFileId: null };
     }
+  } else if (isStory && isImage && !storyParentFolderId) {
+    // Cas oublié avant 2026-05-02 : si parentFolderId manquant, le code tombait sur scheduleimagepost+isStory
+    // → 50% feed grid. Désormais on abort proprement. R13 regression-check garantit cet invariant.
+    console.warn('[story] Image story sans storyParentFolderId pour ' + fileName + ' -> abort (impossible de convertir)');
+    return { ok: false, postId: null, error: 'story image sans parent folder (conversion impossible)', convertedFileId: null };
   }
 
   const mediaUrl   = directUrl || ('https://dashboard.jscaledashboard.online/api/drive-serve?fileId=' + actualFileId);
-  const endpoint   = (isCarousel || (isStory && isImage))
+  // INVARIANT post-2026-05-02 : si on arrive ici avec isStory, isImage est forcément false
+  // (conversion réussie ou abort plus haut). Stories = TOUJOURS schedulevideopost.
+  const endpoint   = (isCarousel)
     ? '/api/scheduleimagepost'
     : '/api/schedulevideopost';
 
@@ -521,7 +571,25 @@ module.exports = async function handler(req, res) {
     if (oauthResult.status === 'fulfilled')  oauthToken    = oauthResult.value;
     else console.error('[drive] OAuth failed:', oauthResult.reason && oauthResult.reason.message);
     if (oneupResult.status === 'fulfilled')  allOneupPosts = oneupResult.value;
-    else console.error('[oneup] fetchAll failed:', oneupResult.reason && oneupResult.reason.message);
+    else {
+      console.error('[oneup] fetchAll FAILED:', oneupResult.reason && oneupResult.reason.message);
+      // CRITIQUE 2026-05-02 : en mode CHECKER, on NE PEUT PAS re-scheduler si on ne sait
+      // pas ce qui existe déjà → ABORT propre (le checker retentera dans 15 min).
+      // Bug du soir : sans ce garde-fou, le checker a re-schedulé 10 doublons.
+      if (isChecker) {
+        console.error('[checker] ABORT — état OneUp inconnu, refus de re-scheduler pour éviter doublons');
+        return res.status(503).json({
+          ok: false,
+          aborted: true,
+          reason: 'oneup_unavailable',
+          detail: oneupResult.reason && oneupResult.reason.message,
+          note: 'checker n\'a PAS re-schedulé (anti-rafale). Retentera au prochain run.'
+        });
+      }
+      // En mode daily-trigger (1×/nuit), on continue avec [] (mode dégradé).
+      // Risque accepté : 1 fail/jour vs 96 fails potentiels en mode checker (4×/h).
+      allOneupPosts = [];
+    }
     if (typeMapResult.status === 'fulfilled' && typeMapResult.value && typeof typeMapResult.value === 'object') {
       typeMap = typeMapResult.value;
       console.log('[registry] Loaded ' + Object.keys(typeMap).length + ' post_type entries');
@@ -881,40 +949,64 @@ module.exports = async function handler(req, res) {
 
     console.log('[cron v3] Phase 3 — ' + scheduledTotal + ' schedulés, ' + failedTotal + ' échoués, ' + pastSkippedTotal + ' slots passés skippés');
 
-    // ── Rapport Telegram ──────────────────────────────────────────────────────
-    const results = [];
+    // ── Rapport Telegram (refonte langage Jordan 2026-05-02) ──────────────────
+    // Détecte les comptes avec Drive vide (count 0 reels ou stories alors que freq > 0).
+    // Source : le résultat scheduling lui-même — si on a needReels mais 0 ok, Drive vide.
+    const lowDriveAccounts = [];
     Object.keys(accountResults).forEach(function(snId) {
       const r = accountResults[snId];
-      if (r.errors.length > 0) {
-        results.push('⚠️ @' + r.uname + ' — ' + r.scheduled + ' ok / ' + r.errors.length + ' erreur(s): ' + r.errors.join(' | '));
-      } else if (r.scheduled > 0) {
-        results.push('✅ @' + r.uname + ' — ' + r.scheduled + ' post(s) programmé(s)');
-      } else {
-        results.push('⚠️ @' + r.uname + ' — 0 post (Drive vide ?)');
+      const acc = accounts[snId];
+      if (!acc || acc.paused) return;
+      const errors = (r.errors || []).join(' ');
+      // Heuristique : si "Drive vide" dans les erreurs OU 0 schedule alors que reels/stories > 0
+      const driveErr = /drive vide|drive empty|0 reels|0 stories/i.test(errors);
+      if (driveErr || (r.scheduled === 0 && (acc.reels > 0 || acc.stories > 0))) {
+        lowDriveAccounts.push({
+          handle:  r.uname,
+          reels:   /reels/i.test(errors) ? 0 : null,
+          stories: /stories/i.test(errors) ? 0 : null,
+          freqR:   acc.reels   || 0,
+          freqS:   acc.stories || 0
+        });
       }
     });
-    skippedReasons.forEach(function(r) { results.push(r); });
 
-    const dur         = ((Date.now() - startTime) / 1000).toFixed(1);
-    const emoji       = (failedTotal > 0 || pastSkippedTotal > 0) ? '⚠️' : '⚡';
-    const captionMode = captionCfg.enabled ? '✨ Claude IA' : '📝 Template';
-    const titlePrefix = isChecker ? '🔧 *Zenty Checker (auto-fix)*' : (emoji + ' *Zenty Daily Scheduler v3*');
-    const lines       = [
-      titlePrefix + ' — ' + targetDateStr,
-      '',
-      '📊 ' + totalAccounts + ' comptes | ' + scheduledTotal + ' programmés | ' + skippedCount + ' déjà OK | ' + failedTotal + ' erreur(s)' + (pastSkippedTotal > 0 ? ' | ' + pastSkippedTotal + ' slots passés skippés' : ''),
-      '🖊️ Captions: ' + captionMode
-    ];
-    if (pastSkippedTotal > 0 && !isChecker) {
-      lines.push('', '🚨 *ALERTE RAFALE ÉVITÉE* : ' + pastSkippedTotal + ' slot(s) dans le passé — probablement daily 01h raté. Vérifier logs /opt/zenty-cron/logs/cron.log. Posts NON rattrapés (évite publication immédiate en rafale).');
-    }
-    if (results.length) lines.push('', results.join('\n'));
-    lines.push('\n⏱ ' + dur + 's');
-    // Mode CHECKER : Telegram silent si rien à corriger (évite spam toutes les 30min)
-    if (isChecker && scheduledTotal === 0 && failedTotal === 0) {
+    // Mode CHECKER silent si rien fait (évite spam toutes les 30min)
+    const checkerSilent = isChecker && scheduledTotal === 0 && failedTotal === 0 && pastSkippedTotal === 0;
+    if (checkerSilent) {
       console.log('[checker] Silent (rien à corriger).');
     } else {
-      await sendTelegram(lines.join('\n'));
+      // 1. Rafale → message dédié si détectée (PRIORITÉ HAUTE)
+      if (pastSkippedTotal > 0 && !isChecker) {
+        try {
+          const tg = require('./_telegram-format.js');
+          await sendTelegram(tg.formatRafaleAlert(pastSkippedTotal, Object.keys(accountResults).length));
+        } catch (e) { console.warn('[telegram-format] not available:', e.message); }
+      }
+
+      // 2. Drive vide → message dédié si détecté (PRIORITÉ HAUTE)
+      if (lowDriveAccounts.length > 0 && !isChecker) {
+        try {
+          const tg = require('./_telegram-format.js');
+          const msg = tg.formatLowDriveAlert(lowDriveAccounts);
+          if (msg) await sendTelegram(msg);
+        } catch (e) { console.warn('[telegram-format] not available:', e.message); }
+      }
+
+      // 3. Pas de message "tout va bien" en mode daily — le digest matin/soir s'en charge.
+      // Pas de message en mode checker sauf si erreurs.
+      if (failedTotal > 0) {
+        const dur = ((Date.now() - startTime) / 1000).toFixed(1);
+        const lines = [
+          '⚠️ *Erreurs scheduling*',
+          '',
+          failedTotal + ' post' + (failedTotal > 1 ? 's' : '') + ' n\'ont pas pu être programmés (' + scheduledTotal + ' OK)',
+          '',
+          '→ Détails dans `journalctl -u zenty-cron`',
+          '⏱ ' + dur + 's'
+        ];
+        await sendTelegram(lines.join('\n'));
+      }
     }
 
     res.status(200).json({
@@ -930,7 +1022,12 @@ module.exports = async function handler(req, res) {
 
   } catch (e) {
     console.error('[cron v3] FATAL:', e);
-    await sendTelegram('🚨 *Zenty Cron ERREUR* — ' + e.message);
+    try {
+      const tg = require('./_telegram-format.js');
+      await sendTelegram(tg.formatFatalError('cron', e.message));
+    } catch (_) {
+      await sendTelegram('🚨 *Zenty Cron ERREUR* — ' + e.message);
+    }
     res.status(500).json({ error: e.message });
   }
 };
