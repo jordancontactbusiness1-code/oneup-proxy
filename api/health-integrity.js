@@ -257,6 +257,51 @@ async function checkMultiAgencyOrphans() {
   };
 }
 
+// ── Check 7b: OneUp data contract — schémas attendus respectés ───────────────
+// Bug détecté 2026-05-02 : side-panel.js lisait `scheduledAt`, `caption`, `type` qui
+// n'existent PAS dans la réponse OneUp API (vraies clés : date_time, content, instagram).
+// Tous les posts s'affichaient avec heure '—' et caption vide → "données menteuses" sur UI.
+// Ce check détecte si l'API OneUp change de format ou si on a un drift de schéma.
+async function checkOneupDataContract() {
+  if (!ONEUP_KEY) return { name: 'oneup_data_contract', ok: true, note: 'no key (skipped)' };
+  try {
+    const r = await fetch('https://www.oneupapp.io/api/getscheduledposts?apiKey=' + ONEUP_KEY);
+    if (!r.ok) return { name: 'oneup_data_contract', ok: false, error: 'HTTP ' + r.status };
+    const j = await r.json();
+    const arr = Array.isArray(j) ? j : (j.data || []);
+    if (!arr.length) return { name: 'oneup_data_contract', ok: true, note: 'no scheduled posts to validate' };
+    // Vérifier les champs ATTENDUS sur le 1er post
+    const p = arr[0];
+    const expected = ['post_id', 'social_network_username', 'date_time', 'content'];
+    const missing = expected.filter(function(k) { return !(k in p); });
+    // Vérifier que date_time est parseable
+    let dateValid = false;
+    if (p.date_time) {
+      const d = new Date(String(p.date_time).replace(' ', 'T'));
+      dateValid = !isNaN(d.getTime());
+    }
+    // Vérifier qu'aucun post n'a un date_time invalide (échantillon 5)
+    const invalidDates = [];
+    arr.slice(0, 5).forEach(function(pp) {
+      const dt = pp.date_time || pp.scheduled_date_time;
+      if (!dt) { invalidDates.push(pp.post_id || '?'); return; }
+      const d = new Date(String(dt).replace(' ', 'T'));
+      if (isNaN(d.getTime())) invalidDates.push(pp.post_id || '?');
+    });
+    return {
+      name: 'oneup_data_contract',
+      ok: missing.length === 0 && dateValid && invalidDates.length === 0,
+      sample: arr.length,
+      missingFields: missing,
+      dateValid: dateValid,
+      invalidDatesCount: invalidDates.length,
+      sampleKeys: Object.keys(p).slice(0, 12)
+    };
+  } catch (e) {
+    return { name: 'oneup_data_contract', ok: false, error: e.message };
+  }
+}
+
 // ── Check 7: Telegram heartbeat ──────────────────────────────────────────────
 // Lit zenty/telegram_last_sent (timestamp). Si > 24h, alerte.
 // (Pour V1, on ne sett pas encore ce field, donc check passe par défaut.)
@@ -292,7 +337,8 @@ module.exports = async function handler(req, res) {
     checkCaptionAIHealth(),
     checkCronTimers(),
     checkMultiAgencyOrphans(),
-    checkTelegramHeartbeat()
+    checkTelegramHeartbeat(),
+    checkOneupDataContract()
   ]);
 
   const allOk = checks.every(function(c) { return c.ok; });
