@@ -574,6 +574,104 @@ async function checkTelegramHeartbeat() {
 }
 
 // ── MAIN HANDLER ─────────────────────────────────────────────────────────────
+// ── Check 14: Caption bank integrity (Phase 7) ───────────────────────────────
+// Vérifie que la banque captions par modèle est saine ET que les shuffle-bags
+// par compte ne sont pas corrompus. AUTO-RÉPARATION : un bag dont le model
+// mismatch / permutation invalide / cursor hors range est DELETE → le prochain
+// pick frontend (captionBankPickForAccount) recréera un bag propre via
+// _captionBankShuffle. Garantit zéro régression silencieuse à scale.
+async function checkCaptionBankIntegrity() {
+  const issues = [];
+  const repairs = [];
+  const MIN_BANK_SIZE = 10;
+
+  const accounts = await fbGet('zenty/cron_config/accounts').catch(function() { return null; }) || {};
+
+  // 1. Lister les modèles utilisés (acc.modelName sur comptes actifs)
+  const usedModels = new Set();
+  const accountsByModel = {};
+  Object.keys(accounts).forEach(function(snid) {
+    const a = accounts[snid];
+    if (!a || a.paused === true || !a.modelName) return;
+    const mk = String(a.modelName).toLowerCase().trim().replace(/\s+/g, '_').replace(/[^a-z0-9_]/g, '');
+    if (!mk) return;
+    usedModels.add(mk);
+    (accountsByModel[mk] = accountsByModel[mk] || []).push(a);
+  });
+
+  // 2. Pour chaque modèle utilisé : vérifier la banque
+  const banksData = {};
+  for (const mk of usedModels) {
+    const bank = await fbGet('zenty/caption_bank/' + mk).catch(function() { return null; });
+    if (!bank || !Array.isArray(bank.captions) || bank.captions.length === 0) {
+      issues.push({ type: 'bank_empty', model: mk, accountsCount: accountsByModel[mk].length });
+      continue;
+    }
+    if (bank.captions.length < MIN_BANK_SIZE) {
+      issues.push({ type: 'bank_too_small', model: mk, count: bank.captions.length, min: MIN_BANK_SIZE });
+    }
+    const dedup = new Set(bank.captions);
+    if (dedup.size !== bank.captions.length) {
+      issues.push({ type: 'bank_duplicates', model: mk, total: bank.captions.length, unique: dedup.size });
+    }
+    banksData[mk] = bank.captions.length;
+  }
+
+  // 3. Pour chaque compte avec modelName + caption_mode != 'ai' : vérifier le bag
+  for (const mk of usedModels) {
+    const bankSize = banksData[mk] || 0;
+    if (!bankSize) continue;
+    for (const a of accountsByModel[mk]) {
+      if (a.captionMode === 'ai') continue;
+      const handle = (a.username || '').replace('@', '').toLowerCase();
+      if (!handle) continue;
+      const handleSafe = handle.replace(/\./g, '_');
+      const bag = await fbGet('zenty/caption_bag/' + handleSafe).catch(function() { return null; });
+      if (!bag) continue; // pas encore de bag = OK (sera créé au 1er pick)
+
+      let shouldRepair = false;
+      let reason = '';
+      if (bag.model !== mk) { shouldRepair = true; reason = 'model_mismatch'; }
+      else if (!Array.isArray(bag.permutation)) { shouldRepair = true; reason = 'permutation_invalid'; }
+      else if (bag.permutation.length !== bankSize) { shouldRepair = true; reason = 'permutation_size_mismatch'; }
+      else if (typeof bag.cursor !== 'number' || bag.cursor < 0 || bag.cursor > bag.permutation.length) {
+        shouldRepair = true; reason = 'cursor_out_of_range';
+      } else {
+        // Vérifier l'intégrité de la permutation : 0..N-1 sans doublon
+        const permSet = new Set(bag.permutation);
+        if (permSet.size !== bag.permutation.length) { shouldRepair = true; reason = 'permutation_duplicates'; }
+        else if (Math.min.apply(null, bag.permutation) < 0 || Math.max.apply(null, bag.permutation) >= bankSize) {
+          shouldRepair = true; reason = 'permutation_out_of_range';
+        }
+      }
+
+      if (shouldRepair) {
+        try {
+          const r = await fetch(FIREBASE_URL + '/zenty/caption_bag/' + handleSafe + '.json' + fbAuth, { method: 'DELETE' });
+          if (r.ok) {
+            repairs.push({ handle: handle, reason: reason, action: 'bag_deleted_for_reshuffle' });
+          } else {
+            issues.push({ type: 'bag_corrupted', handle: handle, reason: reason, repair: 'firebase_delete_failed' });
+          }
+        } catch (e) {
+          issues.push({ type: 'bag_corrupted', handle: handle, reason: reason, repair: 'fetch_error' });
+        }
+      }
+    }
+  }
+
+  return {
+    name: 'caption_bank_integrity',
+    ok: issues.length === 0,
+    usedModels: Array.from(usedModels),
+    banks: banksData,
+    issuesCount: issues.length,
+    issues: issues.slice(0, 10),
+    repairsCount: repairs.length,
+    repairs: repairs.slice(0, 10)
+  };
+}
+
 module.exports = async function handler(req, res) {
   const secret = (req.headers && (req.headers['x-cron-secret'] || req.headers['authorization'])) || (req.query && req.query.secret) || '';
   if (CRON_SECRET && secret !== CRON_SECRET && secret !== 'Bearer ' + CRON_SECRET) {
@@ -597,7 +695,8 @@ module.exports = async function handler(req, res) {
     checkTelegramHeartbeat(),
     checkBrowserErrorsRate(),
     checkSmokeTests(),
-    checkOneupDataContract()
+    checkOneupDataContract(),
+    checkCaptionBankIntegrity()
   ]);
 
   const allOk = checks.every(function(c) { return c.ok; });
