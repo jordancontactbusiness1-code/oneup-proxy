@@ -68,6 +68,42 @@ module.exports = async function handler(req, res) {
     }
   }
 
+  // ── Route spéciale : /api/verify-run → Service VPS verify (F1 cs-senior-engineer 2026-05-02) ──
+  // Appelé par systemd zenty-verify.timer toutes les 30 min.
+  // Cf. oneup-proxy/SYSTEMD_VERIFY.md pour install.
+  if (apiPath === '/api/verify-run') {
+    return require('./verify.js')(req, res);
+  }
+
+  // ── Route spéciale : /api/digest-run → Telegram digest 09h/21h Paris ──
+  // Appelé par systemd zenty-digest-morning.timer + zenty-digest-evening.timer
+  // Cf. oneup-proxy/SYSTEMD_VERIFY.md (section Digest) pour install.
+  if (apiPath === '/api/digest-run') {
+    return require('./digest.js')(req, res);
+  }
+
+  // ── Route spéciale : /api/e2e-test → Healthcheck E2E quotidien (Phase 4) ──
+  // Appelé par systemd zenty-e2e.timer 1×/jour à 14h Paris.
+  // Cf. oneup-proxy/SYSTEMD_VERIFY.md section E2E.
+  if (apiPath === '/api/e2e-test') {
+    return require('./e2e-test.js')(req, res);
+  }
+
+  // ── Route spéciale : /api/stories-cache-cleanup → cleanup mensuel (Phase 3) ──
+  // Appelé par systemd zenty-cache-cleanup.timer 1×/mois (1er à 03h Paris).
+  // Supprime les .mp4 cache > 30j dans stories/ et posted/. ?dry=1 pour test.
+  if (apiPath === '/api/stories-cache-cleanup') {
+    return require('./stories-cache-cleanup.js')(req, res);
+  }
+
+  // ── Route spéciale : /api/drive-scan-run → Scanner Drive auto (Phase 6) ──
+  // Appelé par systemd zenty-drive-scanner.timer toutes les 30 min.
+  // Écrit zenty/drive/folderMap + contentMap + lastScan en Firebase pour que
+  // tous les users (VAs inclus) voient les médias sans cliquer Sync.
+  if (apiPath === '/api/drive-scan-run') {
+    return require('./drive-scanner.js')(req, res);
+  }
+
   // ── Route spéciale : /api/drive-thumbnail → Miniature legere d'un fichier Drive ──
   // GET /api/drive-thumbnail?fileId=xxx → sert la miniature (~20-50KB au lieu de 1MB+)
   if (apiPath === '/api/drive-thumbnail') {

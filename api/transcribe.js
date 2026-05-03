@@ -41,7 +41,7 @@ module.exports = async function handler(req, res) {
 
   if (action === 'submit') {
     if (!audioUrl) { res.status(400).json({ error: true, message: 'audio_url required' }); return; }
-    var submitBody = JSON.stringify({ audio_url: audioUrl, language_detection: true });
+    var submitBody = JSON.stringify({ audio_url: audioUrl, language_detection: true, speech_models: ["universal-2"] });
     var result = await doRequest({
       hostname: 'api.assemblyai.com',
       path: '/v2/transcript',
