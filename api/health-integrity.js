@@ -587,13 +587,18 @@ async function checkCaptionBankIntegrity() {
 
   const accounts = await fbGet('zenty/cron_config/accounts').catch(function() { return null; }) || {};
 
-  // 1. Lister les modèles utilisés (acc.modelName sur comptes actifs)
+  // 1. Lister les modèles utilisés (acc.modelName sur comptes actifs).
+  // Backend Firebase n'a pas modelName direct → fallback dérivation depuis agency
+  // ("FR" → "tina_fr", "US" → "tina_us") pour matcher la convention frontend.
   const usedModels = new Set();
   const accountsByModel = {};
   Object.keys(accounts).forEach(function(snid) {
     const a = accounts[snid];
-    if (!a || a.paused === true || !a.modelName) return;
-    const mk = String(a.modelName).toLowerCase().trim().replace(/\s+/g, '_').replace(/[^a-z0-9_]/g, '');
+    if (!a || a.paused === true) return;
+    let modelName = a.modelName || '';
+    if (!modelName && a.agency) modelName = 'Tina ' + String(a.agency).toUpperCase();
+    if (!modelName) return;
+    const mk = String(modelName).toLowerCase().trim().replace(/\s+/g, '_').replace(/[^a-z0-9_]/g, '');
     if (!mk) return;
     usedModels.add(mk);
     (accountsByModel[mk] = accountsByModel[mk] || []).push(a);
