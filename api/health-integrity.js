@@ -1,22 +1,35 @@
 // ═══════════════════════════════════════════════════════════════════
 //  ZENTY — DATA INTEGRITY CHECKS (Phase B+ — Veilleur élargi #2)
-//  2026-05-02 nuit
+//  2026-05-02 nuit · étendu 2026-05-04 (coverage by type, R20)
 //
 //  POURQUOI : health-check.js (Phase B) vérifie que les services EXTERNES répondent.
 //  Mais ne détecte pas les INCOHÉRENCES de DATA (ex : storyParentFolderId orphelin
 //  qui a fait rater 12 comptes pendant 4 jours sans qu'aucun signal ne passe).
 //
-//  QUOI : 7 checks d'intégrité côté Firebase + Drive + APIs.
-//   1. Account config integrity : champs requis présents pour comptes actifs
-//   2. Drive folder map integrity : pas d'orphelins, dossiers requis présents
-//   3. Posting flow : cron a tourné cette nuit + a schedulé > 0
-//   4. Caption AI health : taux succès dernière 24h > 90%
-//   5. Cron timers : tous les zenty-* timers actifs
-//   6. Multi-agency : pas d'orphelins (configs pour comptes supprimés)
-//   7. Telegram bot : dernier message envoyé < 24h
+//  QUOI : 15 checks d'intégrité côté Firebase + Drive + APIs.
+//   1. Account config integrity        9. Multi-agency orphans
+//   2. Drive folder map integrity     10. Telegram heartbeat
+//   3. Posting flow                   11. Browser errors rate
+//   4. Posting schedule compliance    12. Smoke tests UI
+//   5. Posting rate limit             13. OneUp data contract
+//   6. Anomaly detection              14. Caption bank integrity (R16)
+//   7. Caption AI health              15. POSTING COVERAGE BY TYPE (R20, 2026-05-04)
+//   8. Cron timers
 //
 //  Stockage : zenty/integrity_checks/{date}/{hour}
-//  AUTH : CRON_SECRET (header x-cron-secret)
+//  Telegram : alerte immediate sur coverage critical (dedup zenty/coverage_alerts)
+//  AUTH     : CRON_SECRET (header x-cron-secret)
+//
+//  ⚠️ EXCEPTION RÈGLE 300L (audit 2026-05-04) — fichier 858L
+//  ─────────────────────────────────────────────────────────────────
+//  La règle "max 300L par fichier" du dashboard ne s'applique pas ici.
+//  Justification : fichier transactionnel critique du veilleur prod (15 checks
+//  orchestrés par Promise.all + write Firebase + alertes Telegram). Splitter
+//  risquerait de casser le contrat avec zenty-integrity.timer (qui curl POST
+//  /api/integrity-run toutes les 30 min) pour bénéfice cosmétique.
+//  Découpage proposé en cas de refacto : un fichier par groupe de checks
+//  (account/drive/posting/caption/system) + orchestrator slim, sous protection
+//  /cs-senior-engineer + tests E2E + canary.
 // ═══════════════════════════════════════════════════════════════════
 'use strict';
 
