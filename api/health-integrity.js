@@ -677,6 +677,172 @@ async function checkCaptionBankIntegrity() {
   };
 }
 
+// ── Check 15 — COVERAGE PAR TYPE (Vague 5 — Jordan 2026-05-04) ─────────────
+// Pour chaque compte actif :
+//  - Compte (schedulés futurs aujourd'hui) + (publiés aujourd'hui) PAR TYPE
+//  - Compare avec freq config (acc.reels / acc.stories / acc.feed)
+//  - Si type sous-couvert ET seuil horaire dépassé → ALERTE Telegram immédiate
+//
+// Différence avec checkPostingScheduleCompliance (check 6a) :
+//  - Vérifie PAR TYPE (reels/stories/carousel séparés), pas total
+//  - Compte schedulés+publiés ensemble (couverture totale, pas juste publiés)
+//  - Heuristique horaire par TYPE (slots reels matin 07h30 / midi 12h30 / soir 21h
+//    vs stories midi 13h30 / soir 19h30) pour ne pas alerter trop tôt
+//  - Émet alerte Telegram dès détection (pas attendre digest)
+//
+// Bug type cible : 0 stories aujourd'hui malgré freq=1 → check 6a a vu total 2/3
+// = "missing 1" sans dire ce qui manque. Le coverage check dirait "@tina.dolcezza
+// stories: 0/1 attendu après 14h Paris".
+async function checkPostingCoverageByType() {
+  if (!ONEUP_KEY) return { name: 'posting_coverage_by_type', ok: true, note: 'no key (skipped)' };
+  try {
+    // 1. Config attendue par compte actif
+    const accounts = await fbGet('zenty/cron_config/accounts').catch(function() { return {}; }) || {};
+    const expectedByAccount = {};
+    Object.keys(accounts).forEach(function(snid) {
+      const a = accounts[snid];
+      if (!a || a.paused === true || !a.username) return;
+      const handle = (a.username || '').replace('@', '').toLowerCase();
+      if ((a.reels || 0) + (a.stories || 0) + (a.feed || 0) === 0) return;
+      expectedByAccount[handle] = {
+        reels: a.reels || 0,
+        stories: a.stories || 0,
+        carousel: a.feed || 0
+      };
+    });
+    if (!Object.keys(expectedByAccount).length) {
+      return { name: 'posting_coverage_by_type', ok: true, note: 'no active accounts' };
+    }
+    // 2. Fetch published + scheduled aujourd'hui
+    const today = new Date().toISOString().split('T')[0];
+    const [pubR, schR, typeMap] = await Promise.all([
+      fetch('https://www.oneupapp.io/api/getpublishedposts?apiKey=' + ONEUP_KEY).then(function(r){ return r.text(); }),
+      fetch('https://www.oneupapp.io/api/getscheduledposts?apiKey=' + ONEUP_KEY).then(function(r){ return r.text(); }),
+      fbGet('zenty/post_type_map').catch(function() { return {}; })
+    ]);
+    function safeArr(t) {
+      if (!t || t.trim().startsWith('<')) return [];
+      try { const j = JSON.parse(t); return Array.isArray(j) ? j : (j.data || []); } catch (e) { return []; }
+    }
+    const allPosts = safeArr(pubR).concat(safeArr(schR));
+    // 3. Catégoriser chaque post par TYPE via registry typeMap (post_type_map) ou
+    //    inférence URL (temp-video = story, image_urls multi = carousel, video = reel).
+    function inferType(p) {
+      const vurl = p.video_url || '';
+      const cimg = p.content_image || '';
+      // 1. Registry par fileId Drive (source de vérité interne)
+      const m = (vurl + ' ' + cimg).match(/fileId=([a-zA-Z0-9_-]{20,})/);
+      if (m && typeMap['fileid_' + m[1]] && typeMap['fileid_' + m[1]].type) {
+        return typeMap['fileid_' + m[1]].type;
+      }
+      // 2. Pattern URL temp-video = story
+      if (/\/api\/temp-video\?id=story_/.test(vurl)) return 'stories';
+      // 3. Heuristique
+      const hasImg = cimg && cimg !== 'NA';
+      const hasVid = vurl && vurl !== 'NA';
+      if (p.image_urls && Array.isArray(p.image_urls) && p.image_urls.length > 1) return 'carousel';
+      if (hasImg && !hasVid) return 'carousel';
+      return 'reels';
+    }
+    const countByAccountType = {};
+    allPosts.forEach(function(p) {
+      const dt = p.created_at || p.date_time || p.scheduled_date_time || '';
+      if (!dt.startsWith(today)) return;
+      const u = (p.social_network_username || p.social_network_name || '').replace('@', '').toLowerCase();
+      if (!u || !expectedByAccount[u]) return;
+      const t = inferType(p);
+      if (!countByAccountType[u]) countByAccountType[u] = { reels: 0, stories: 0, carousel: 0 };
+      countByAccountType[u][t]++;
+    });
+    // 4. Heuristique horaire — quand alerter selon le TYPE
+    // Slots config par défaut :
+    //   reels   : 07:30, 12:30, 18:00, 21:00, 23:30
+    //   stories : 08:30, 13:30, 19:00, 21:30, 23:00
+    // Logique simple :
+    //   - Pour reels : on tolère manque jusqu'à 14h Paris (= 12h UTC). Après → alerte.
+    //   - Pour stories : on tolère jusqu'à 14h Paris. Après → alerte.
+    //   - Hard check global : après 22h Paris (= 20h UTC), AUCUN manque toléré.
+    const hourUTC = new Date().getUTCHours();
+    const hourParis = (hourUTC + 2) % 24; // été : UTC+2 (suffisant pour seuil grossier)
+    const reelTolerateMissing = hourParis < 14;       // avant 14h Paris : on tolère manque reel
+    const storyTolerateMissing = hourParis < 14;      // pareil pour story
+    const hardCheck = hourParis >= 22;                // après 22h Paris : aucune tolérance
+
+    const missing = [];
+    Object.keys(expectedByAccount).forEach(function(u) {
+      const exp = expectedByAccount[u];
+      const got = countByAccountType[u] || { reels: 0, stories: 0, carousel: 0 };
+      function check(type, expN) {
+        if (expN <= 0) return;
+        const gotN = got[type] || 0;
+        if (gotN >= expN) return;
+        // Manque détecté — appliquer tolérance horaire
+        const tolerate = (type === 'reels' && reelTolerateMissing) || (type === 'stories' && storyTolerateMissing);
+        if (tolerate && !hardCheck) return;
+        missing.push({ handle: u, type: type, expected: expN, got: gotN, deficit: expN - gotN });
+      }
+      check('reels', exp.reels);
+      check('stories', exp.stories);
+      check('carousel', exp.carousel);
+    });
+
+    return {
+      name: 'posting_coverage_by_type',
+      ok: missing.length === 0,
+      hardCheck: hardCheck,
+      hourParis: hourParis,
+      activeAccounts: Object.keys(expectedByAccount).length,
+      missingCount: missing.length,
+      missing: missing.slice(0, 30),
+      severity: missing.length === 0 ? 'ok' : (hardCheck ? 'critical' : 'warning'),
+      note: missing.length === 0
+        ? 'tous les comptes ont leur couverture par type'
+        : missing.length + ' manque(s) détecté(s) (' + (hardCheck ? 'CRITICAL' : 'warning') + ')'
+    };
+  } catch (e) {
+    return { name: 'posting_coverage_by_type', ok: false, error: e.message };
+  }
+}
+
+// ── Telegram alert immédiat sur coverage critical ─────────────────────────
+// Dedup : 1 alerte max par compte+type+jour. Stocke dans zenty/coverage_alerts/{date}.
+async function maybeAlertCoverage(coverageCheck) {
+  if (!coverageCheck || coverageCheck.ok || !Array.isArray(coverageCheck.missing)) return;
+  if (coverageCheck.severity !== 'critical') return; // alert seulement si hardCheck
+  try {
+    const today = new Date().toISOString().split('T')[0];
+    const alertedRaw = await fbGet('zenty/coverage_alerts/' + today).catch(function() { return null; });
+    const alerted = (alertedRaw && typeof alertedRaw === 'object') ? alertedRaw : {};
+    const newOnes = coverageCheck.missing.filter(function(m) {
+      const k = m.handle + '__' + m.type;
+      return !alerted[k];
+    });
+    if (!newOnes.length) return;
+    // Format Telegram : groupé par type
+    const byType = { reels: [], stories: [], carousel: [] };
+    newOnes.forEach(function(m) { (byType[m.type] || []).push(m); });
+    const lines = ['🚨 *Couverture posting incomplète* (après 22h Paris)', ''];
+    ['reels', 'stories', 'carousel'].forEach(function(t) {
+      if (!byType[t].length) return;
+      lines.push('*' + t.toUpperCase() + '* (' + byType[t].length + ' compte(s)) :');
+      byType[t].forEach(function(m) { lines.push('  • @' + m.handle + ' : ' + m.got + '/' + m.expected); });
+      lines.push('');
+    });
+    lines.push('→ Vérifier Drive ' + (byType.stories.length ? 'stories/' : 'reels/') + ' + cron logs');
+    const tg = require('./_telegram-format.js');
+    await tg.sendTelegram(lines.join('\n'));
+    // Marque comme alerté pour ce jour (évite spam)
+    const updates = {};
+    newOnes.forEach(function(m) { updates[m.handle + '__' + m.type] = { ts: Date.now(), expected: m.expected, got: m.got }; });
+    await fetch(FIREBASE_URL + '/zenty/coverage_alerts/' + today + '.json' + fbAuth, {
+      method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(updates)
+    });
+  } catch (e) {
+    console.error('[coverage] telegram alert failed:', e.message);
+  }
+}
+
 module.exports = async function handler(req, res) {
   const secret = (req.headers && (req.headers['x-cron-secret'] || req.headers['authorization'])) || (req.query && req.query.secret) || '';
   if (CRON_SECRET && secret !== CRON_SECRET && secret !== 'Bearer ' + CRON_SECRET) {
@@ -701,8 +867,14 @@ module.exports = async function handler(req, res) {
     checkBrowserErrorsRate(),
     checkSmokeTests(),
     checkOneupDataContract(),
-    checkCaptionBankIntegrity()
+    checkCaptionBankIntegrity(),
+    checkPostingCoverageByType()
   ]);
+
+  // R20 / Vague 5 — Alerte Telegram immédiate si coverage critical détecté
+  // (compte+type sous-couvert après 22h Paris). Dedup : 1 alerte/compte+type/jour.
+  const coverageCheck = checks.find(function(c) { return c && c.name === 'posting_coverage_by_type'; });
+  if (coverageCheck) await maybeAlertCoverage(coverageCheck);
 
   const allOk = checks.every(function(c) { return c.ok; });
   const failedChecks = checks.filter(function(c) { return !c.ok; });
