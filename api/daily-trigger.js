@@ -36,6 +36,7 @@
 'use strict';
 
 const fetch = require('node-fetch');
+const captionBank = require('./_caption-bank.js');
 
 // ── API keys ──────────────────────────────────────────────────────────────────
 const ONEUP_KEY      = process.env.ONEUP_API_KEY        || '';
@@ -364,13 +365,34 @@ async function callAnthropic(uname, template, fileName) {
   return ((d.content && d.content[0] && d.content[0].text) || '').trim();
 }
 
-async function generateCaption(fileId, type, uname, captionCfg, fileName) {
+async function generateCaption(fileId, type, uname, captionCfg, fileName, accountRecord) {
   const template = (captionCfg && captionCfg.template) || '';
 
-  // Stories : template uniquement (pas d'IA)
+  // Stories : template uniquement (pas d'IA, pas de banque — peu visible sur stories)
   if (type === 'stories') return template;
 
-  // IA désactivée ou pas de clé
+  // ── R17 / Phase 7+ — BANQUE EN PRIORITÉ AVANT IA (2026-05-04) ──
+  // Si le compte a un modelName (ou agency dérivé) ET que la banque
+  // zenty/caption_bank/{modelKey} existe, on pioche dedans via shuffle-bag.
+  // Garanties identiques au frontend (js/captions/bank.js) : zéro répétition
+  // dans un cycle complet de N captions, par compte. Pas d'override 'ai' ici
+  // (Jordan peut le forcer via le frontend en local, mais le cron tente
+  // toujours la banque d'abord — c'est le comportement scaling voulu).
+  try {
+    const modelName = captionBank.deriveModelName(accountRecord);
+    if (modelName) {
+      const fromBank = await captionBank.pickFromBank(uname, modelName);
+      if (fromBank) {
+        console.log('[caption] Bank pick @' + uname + ' [' + modelName + ']: "' + fromBank.substring(0, 50) + '"');
+        return fromBank;
+      }
+    }
+  } catch (e) {
+    console.error('[caption] Bank error @' + uname + ':', e.message);
+    // continue → fallback IA / template
+  }
+
+  // IA désactivée ou pas de clé → template
   if (!captionCfg || !captionCfg.enabled || !ANTHROPIC_KEY) return template;
 
   // Cache Firebase — clé par (fileId, uname) pour éviter caption identique
@@ -867,7 +889,9 @@ module.exports = async function handler(req, res) {
           const batch = futurePlan.slice(ci2, ci2 + CAPTION_BATCH);
           await Promise.all(
             batch.map(function(item) {
-              return generateCaption(item.file.id, item.type, item.uname, captionCfg, item.file.name)
+              // R17 / Phase 7+ — passer item.acc pour permettre la pioche banque
+              // (deriveModelName lit acc.modelName ou acc.agency).
+              return generateCaption(item.file.id, item.type, item.uname, captionCfg, item.file.name, item.acc)
                 .then(function(cap) { item.caption = cap; });
             })
           );
