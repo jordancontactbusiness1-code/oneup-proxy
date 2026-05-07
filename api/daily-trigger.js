@@ -211,6 +211,35 @@ async function moveFileToDrive(token, fileId, fromId, toId) {
   return true;
 }
 
+// ── OneUp social accounts list (source vérité des comptes connectés) ─────────
+// Retourne la liste des comptes IG actuellement reliés à OneUp via API key.
+// Format réel API OneUp : { message:'OK', error:false, data:[{ username,
+// social_account_id, full_name, is_expired, social_network_type, need_refresh }] }
+// On retourne un tuple { snids:Set<string>, byUsername:Map<string,obj> }.
+// Throw si la réponse n'est pas exploitable — le caller décide d'abort.
+async function fetchOneupSocialAccounts() {
+  const r = await fetch(ONEUP_BASE + '/api/listsocialaccounts?apiKey=' + ONEUP_KEY);
+  if (!r.ok) throw new Error('HTTP ' + r.status + ' from listsocialaccounts');
+  const txt = await r.text();
+  if (txt.trim().startsWith('<')) throw new Error('listsocialaccounts returned HTML (likely 502/rate limit)');
+  let raw;
+  try { raw = JSON.parse(txt); }
+  catch (e) { throw new Error('listsocialaccounts JSON parse failed: ' + e.message); }
+  const list = Array.isArray(raw) ? raw : (raw.data || raw.accounts || []);
+  if (!Array.isArray(list)) throw new Error('listsocialaccounts unexpected shape');
+  const snids = new Set();
+  const byUsername = {};
+  list.forEach(function(a) {
+    const snid = String(a.social_account_id || a.social_network_id || a.id || '');
+    const un = String(a.username || a.social_network_username || a.social_network_name || '').replace('@','').toLowerCase().trim();
+    if (snid) {
+      snids.add(snid);
+      if (un) byUsername[un] = { snid: snid, isExpired: !!a.is_expired, needRefresh: !!a.need_refresh };
+    }
+  });
+  return { snids: snids, byUsername: byUsername, total: list.length };
+}
+
 // ── Anti-doublon OneUp ────────────────────────────────────────────────────────
 // Récupère TOUS les posts schedulés via pagination (OneUp retourne ~50 par page).
 // Appelé UNE SEULE FOIS au démarrage du cron, résultat partagé entre tous les comptes.
@@ -555,16 +584,63 @@ module.exports = async function handler(req, res) {
 
     console.log('[cron v3] Caption mode: ' + captionMode);
 
+    // ── R24 (2026-05-07) — FILTRE OneUp listsocialaccounts ──────────────────
+    // Un compte dans cron_config n'est pas forcément connecté à OneUp en réalité.
+    // Trois sources de divergence observées :
+    //   1. Comptes OneUp jamais activés sur l'automatisation Zenty (warmup)
+    //   2. Comptes cron_config résiduels (snid sans username, sync foiré)
+    //   3. Comptes cron_config dont le profil OneUp a été supprimé/déconnecté
+    //      (le scheduler tente, OneUp répond invalid snid, post échoue silencieux)
+    //
+    // Source vérité = OneUp /api/listsocialaccounts. On ne traite que les snid
+    // présents là ET dans cron_config ET non paused ET avec username.
+    var oneupSnids = new Set();
+    var oneupByUsername = {};
+    var oneupTotal = 0;
+    try {
+      const oneup = await fetchOneupSocialAccounts();
+      oneupSnids = oneup.snids;
+      oneupByUsername = oneup.byUsername;
+      oneupTotal = oneup.total;
+    } catch (e) {
+      console.error('[cron v3] listsocialaccounts FAILED:', e.message);
+      // En mode CHECKER, abort propre (le scheduler ne peut pas filtrer).
+      // En mode daily, on tente de continuer avec accounts vide → 0 post programmé.
+      if (isChecker) {
+        return res.status(503).json({
+          ok: false, aborted: true, reason: 'listsocialaccounts_unavailable',
+          detail: e.message
+        });
+      }
+      // mode daily : skip l'optimisation R24, comportement pré-R24 (ce qui peut
+      // poster des fantômes, mais mieux que 0 post si OneUp API down passagère)
+      console.warn('[cron v3] R24 skip — fallback: traiter tous les comptes cron_config');
+    }
+
+    // Compteurs pour log clair
+    const cronAccountsTotal = Object.keys(accounts).length;
+    const cronActive = Object.keys(accounts).filter(function(s) { return accounts[s] && accounts[s].paused !== true; }).length;
+    const cronPaused = cronAccountsTotal - cronActive;
+    var intersectionActive = 0;
+    Object.keys(accounts).forEach(function(snid) {
+      const a = accounts[snid];
+      if (!a || a.paused === true) return;
+      if (!a.username) return; // résidu sans username
+      if (oneupSnids.size > 0 && !oneupSnids.has(String(snid))) return; // R24
+      intersectionActive++;
+    });
+    console.log('[cron v3] Comptes : OneUp=' + oneupTotal + ', cron_config=' + cronAccountsTotal + ' (active=' + cronActive + ', paused=' + cronPaused + '), intersection actifs=' + intersectionActive);
+
     // ── PRE-CHECK BANQUE OBLIGATOIRE (R23, 2026-05-07) ──────────────────────
     // La banque ne doit JAMAIS être indisponible. On charge les banques utilisées
-    // par les comptes actifs avant Phase 1. Si la moindre est vide ou manquante,
-    // ABORT tout le run avec alerte Telegram critique. Mieux 0 reel programmé
-    // (Jordan voit l'alerte, fixe la banque, retrigger) que 12 reels postés
-    // avec template ou IA hallucinée.
+    // par les comptes ACTIFS RÉELS (intersection OneUp + cron, R24) avant Phase 1.
+    // Si la moindre est vide ou manquante, ABORT tout le run avec Telegram critique.
     const requiredModels = new Set();
     Object.keys(accounts).forEach(function(snid) {
       const a = accounts[snid];
       if (!a || a.paused === true) return;
+      if (!a.username) return; // résidu
+      if (oneupSnids.size > 0 && !oneupSnids.has(String(snid))) return; // R24
       const m = captionBank.deriveModelName(a);
       if (m) requiredModels.add(m);
     });
@@ -732,6 +808,16 @@ module.exports = async function handler(req, res) {
       if (acc.paused === true) {
         skippedCount++;
         skippedReasons.push('⏸ @' + uname + ' — pause manuelle');
+        continue;
+      }
+
+      // R24 (2026-05-07) : skip si snid pas/plus connecté à OneUp.
+      // Évite les tentatives de scheduling vers des social_account_id invalides
+      // qui font échouer silencieusement le post + flood les logs.
+      // (Si oneupSnids vide = listsocialaccounts a échoué → fallback : on traite tout)
+      if (oneupSnids.size > 0 && !oneupSnids.has(String(snId))) {
+        skippedCount++;
+        skippedReasons.push('🔌 @' + uname + ' — pas connecte a OneUp (snid ' + snId + ' absent de listsocialaccounts)');
         continue;
       }
 
