@@ -218,6 +218,7 @@ async function moveFileToDrive(token, fileId, fromId, toId) {
 // On retourne un tuple { snids:Set<string>, byUsername:Map<string,obj> }.
 // Throw si la réponse n'est pas exploitable — le caller décide d'abort.
 async function fetchOneupSocialAccounts() {
+  console.log('[oneup] listsocialaccounts: KEY len=' + ONEUP_KEY.length + ' head4=' + ONEUP_KEY.slice(0,4));
   const r = await fetch(ONEUP_BASE + '/api/listsocialaccounts?apiKey=' + ONEUP_KEY);
   if (!r.ok) throw new Error('HTTP ' + r.status + ' from listsocialaccounts');
   const txt = await r.text();
@@ -227,6 +228,9 @@ async function fetchOneupSocialAccounts() {
   catch (e) { throw new Error('listsocialaccounts JSON parse failed: ' + e.message); }
   const list = Array.isArray(raw) ? raw : (raw.data || raw.accounts || []);
   if (!Array.isArray(list)) throw new Error('listsocialaccounts unexpected shape');
+  if (list.length === 0) {
+    console.warn('[oneup] listsocialaccounts returned 0 — raw response (first 400 chars): ' + txt.slice(0, 400));
+  }
   const snids = new Set();
   const byUsername = {};
   list.forEach(function(a) {
