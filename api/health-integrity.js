@@ -856,6 +856,159 @@ async function maybeAlertCoverage(coverageCheck) {
   }
 }
 
+// ── Check 16: Caption bank actually used in production (R21, 2026-05-07) ──
+// Pourquoi : R16 vérifie que la banque Firebase est intègre + R19 vérifie que
+// daily-trigger.js require _caption-bank.js. Mais aucun des deux ne détecte
+// si en pratique le cron pioche réellement dans la banque ou tombe sur l'IA
+// (ou pire, sur un fallback template muet) à cause d'un autre bug.
+//
+// Cas réel 2026-05-07 : /opt/zenty-cron/daily-trigger.js était une copie
+// pré-Phase 7 qui ne pioche pas, mais R19 sur oneup-proxy/api/ disait OK.
+// Tous les Reels postés étaient en IA Claude Haiku, 0% banque, sans alerte.
+//
+// Ce check récupère les 30 derniers posts OneUp published, les compare au
+// pool caption_bank/{modelKey}, et alerte si <50% match sur >10 posts.
+async function checkCaptionBankUsage() {
+  if (!ONEUP_KEY) {
+    return { name: 'caption_bank_usage', ok: true, skipped: 'no_oneup_key' };
+  }
+  try {
+    // 1. Récupère les caption_bank pour les modèles connus
+    const banks = {};
+    for (const k of ['tina_fr', 'tina_us']) {
+      const b = await fbGet('zenty/caption_bank/' + k).catch(function() { return null; });
+      if (b && Array.isArray(b.captions) && b.captions.length) {
+        banks[k] = new Set(b.captions.map(function(c) { return String(c || '').trim(); }));
+      }
+    }
+    if (!Object.keys(banks).length) {
+      return { name: 'caption_bank_usage', ok: true, skipped: 'no_bank_data' };
+    }
+
+    // 2. Récupère les 50 derniers OneUp published posts
+    const r = await fetch('https://www.oneupapp.io/api/getpublishedposts?start=0&apiKey=' + ONEUP_KEY);
+    if (!r.ok) {
+      return { name: 'caption_bank_usage', ok: true, skipped: 'oneup_http_' + r.status };
+    }
+    const txt = await r.text();
+    if (txt.trim().startsWith('<')) {
+      return { name: 'caption_bank_usage', ok: true, skipped: 'oneup_html_response' };
+    }
+    let raw;
+    try { raw = JSON.parse(txt); }
+    catch (e) { return { name: 'caption_bank_usage', ok: true, skipped: 'oneup_parse_fail' }; }
+    const posts = Array.isArray(raw) ? raw : (raw.data || []);
+    if (!posts.length) return { name: 'caption_bank_usage', ok: true, skipped: 'no_posts' };
+
+    // 3. Récupère le template courant (banque OU template = OK, IA hors-pool = NOK)
+    const cronCfg = await fbGet('zenty/cron_config/captionConfig').catch(function() { return null; });
+    const tmpl = cronCfg && cronCfg.template ? String(cronCfg.template).trim() : '';
+
+    // 4. Compare. On ne classifie que les Reels/carousel (stories = template par design,
+    // ne consultent pas la banque dans generateCaption).
+    const sample = posts.slice(0, 30);
+    let totalEligible = 0;
+    let inBank = 0;
+    let isTemplate = 0;
+    let hors = 0;
+    const horsExamples = [];
+    sample.forEach(function(p) {
+      const cnt = String(p.content || '').trim();
+      if (!cnt) return;
+      // Skip stories : on ne peut pas distinguer story d'un Reel via OneUp api
+      // facilement, donc on classe sur le contenu : si == template OU dans une banque
+      // OU IA-style → tout passe par le check, mais les stories sont template par
+      // design donc majoritairement classées "isTemplate" (= OK).
+      totalEligible++;
+      if (tmpl && cnt === tmpl) { isTemplate++; return; }
+      let matched = false;
+      for (const k of Object.keys(banks)) {
+        if (banks[k].has(cnt)) { matched = true; break; }
+      }
+      if (matched) { inBank++; }
+      else {
+        hors++;
+        if (horsExamples.length < 5) {
+          const un = (p.social_network_username || p.social_network_name || '').replace('@','');
+          horsExamples.push({ handle: un.toLowerCase(), caption: cnt.substring(0, 80) });
+        }
+      }
+    });
+
+    if (totalEligible === 0) {
+      return { name: 'caption_bank_usage', ok: true, skipped: 'no_eligible' };
+    }
+    const pct_bank = Math.round((inBank / totalEligible) * 100);
+    const pct_template = Math.round((isTemplate / totalEligible) * 100);
+    const pct_hors = Math.round((hors / totalEligible) * 100);
+
+    // Verdict :
+    //   - hors > 50% sur >=10 posts = CRITICAL (banque pas utilisée alors qu'elle devrait)
+    //   - hors > 80% sur >=5 posts  = CRITICAL urgent (gros bug)
+    //   - sinon OK même si quelques hors-pool (peut être une migration en cours)
+    let ok = true;
+    let severity = 'info';
+    if (totalEligible >= 10 && hors / totalEligible > 0.5) {
+      ok = false;
+      severity = 'critical';
+    } else if (totalEligible >= 5 && hors / totalEligible > 0.8) {
+      ok = false;
+      severity = 'critical';
+    }
+
+    return {
+      name: 'caption_bank_usage',
+      ok: ok,
+      severity: severity,
+      total: totalEligible,
+      in_bank: inBank,
+      in_template: isTemplate,
+      hors_pool: hors,
+      pct_bank: pct_bank,
+      pct_template: pct_template,
+      pct_hors: pct_hors,
+      hors_examples: horsExamples,
+      banks_loaded: Object.keys(banks)
+    };
+  } catch (e) {
+    return { name: 'caption_bank_usage', ok: true, skipped: 'check_error', error: e.message };
+  }
+}
+
+// Telegram alert si banque cesse d'être utilisée (dedup 1 alerte/jour)
+async function maybeAlertBankUsage(c) {
+  if (!c || c.ok || c.severity !== 'critical') return;
+  try {
+    const today = new Date().toISOString().split('T')[0];
+    const alertedRaw = await fbGet('zenty/bank_usage_alerts/' + today).catch(function() { return null; });
+    if (alertedRaw && alertedRaw.ts) return; // déjà alerté aujourd'hui
+    const lines = [
+      '🚨 *Banque captions PAS utilisée par le cron*',
+      '',
+      'Sur ' + c.total + ' posts récents :',
+      '  • banque : ' + c.in_bank + ' (' + c.pct_bank + '%)',
+      '  • template : ' + c.in_template + ' (' + c.pct_template + '%)',
+      '  • *hors-pool : ' + c.hors_pool + ' (' + c.pct_hors + '%)*',
+      '',
+      'Exemples hors-pool :'
+    ];
+    (c.hors_examples || []).forEach(function(e) {
+      lines.push('  • @' + e.handle + ' : "' + e.caption + '"');
+    });
+    lines.push('');
+    lines.push('→ Check `/opt/zenty-cron/daily-trigger.js` require _caption-bank + pickFromBank');
+    lines.push('→ Vérifier `zenty/cron_config/accounts/*` ont bien agency ou modelName');
+    const tg = require('./_telegram-format.js');
+    await tg.sendTelegram(lines.join('\n'));
+    await fetch(FIREBASE_URL + '/zenty/bank_usage_alerts/' + today + '.json' + fbAuth, {
+      method: 'PUT', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ts: Date.now(), pct_hors: c.pct_hors, total: c.total })
+    });
+  } catch (e) {
+    console.error('[bank_usage] telegram alert failed:', e.message);
+  }
+}
+
 module.exports = async function handler(req, res) {
   const secret = (req.headers && (req.headers['x-cron-secret'] || req.headers['authorization'])) || (req.query && req.query.secret) || '';
   if (CRON_SECRET && secret !== CRON_SECRET && secret !== 'Bearer ' + CRON_SECRET) {
@@ -881,13 +1034,19 @@ module.exports = async function handler(req, res) {
     checkSmokeTests(),
     checkOneupDataContract(),
     checkCaptionBankIntegrity(),
-    checkPostingCoverageByType()
+    checkPostingCoverageByType(),
+    checkCaptionBankUsage()
   ]);
 
   // R20 / Vague 5 — Alerte Telegram immédiate si coverage critical détecté
   // (compte+type sous-couvert après 22h Paris). Dedup : 1 alerte/compte+type/jour.
   const coverageCheck = checks.find(function(c) { return c && c.name === 'posting_coverage_by_type'; });
   if (coverageCheck) await maybeAlertCoverage(coverageCheck);
+
+  // R21 (2026-05-07) — Alerte Telegram si banque cesse d'être effectivement
+  // utilisée par le cron prod (>50% des posts récents hors pool). Dedup 1/jour.
+  const bankUsageCheck = checks.find(function(c) { return c && c.name === 'caption_bank_usage'; });
+  if (bankUsageCheck) await maybeAlertBankUsage(bankUsageCheck);
 
   const allOk = checks.every(function(c) { return c.ok; });
   const failedChecks = checks.filter(function(c) { return !c.ok; });
