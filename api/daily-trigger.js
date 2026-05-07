@@ -882,25 +882,25 @@ module.exports = async function handler(req, res) {
     const CAPTION_BATCH = 15; // max appels Anthropic simultanés
     const futurePlan    = plan.filter(function(i){ return !i.skipPast; });
     if (futurePlan.length > 0) {
-      if (captionCfg.enabled && ANTHROPIC_KEY) {
-        const aiCount = futurePlan.filter(function(i) { return i.type !== 'stories'; }).length;
-        console.log('[caption] Génération de ' + aiCount + ' caption(s) IA — batches de ' + CAPTION_BATCH + '...');
-        for (var ci2 = 0; ci2 < futurePlan.length; ci2 += CAPTION_BATCH) {
-          const batch = futurePlan.slice(ci2, ci2 + CAPTION_BATCH);
-          await Promise.all(
-            batch.map(function(item) {
-              // R17 / Phase 7+ — passer item.acc pour permettre la pioche banque
-              // (deriveModelName lit acc.modelName ou acc.agency).
-              return generateCaption(item.file.id, item.type, item.uname, captionCfg, item.file.name, item.acc)
-                .then(function(cap) { item.caption = cap; });
-            })
-          );
-        }
-        console.log('[caption] Toutes les captions prêtes.');
-      } else {
-        futurePlan.forEach(function(item) { item.caption = captionCfg.template || ''; });
-        if (captionCfg.template) console.log('[caption] Mode template — "' + captionCfg.template + '"');
+      // R19/R21 (2026-05-07) : TOUJOURS appeler generateCaption().
+      // generateCaption() tente la banque AVANT l'IA AVANT le template — c'est le
+      // seul chemin qui consulte la banque captions Firebase.
+      // Bug détecté en prod : sans ANTHROPIC_API_KEY dans /opt/zenty-cron/.env, le
+      // code skippait generateCaption() et tombait direct sur le template, ce qui
+      // faisait que la banque (70 captions Tina FR) n'était JAMAIS pioché côté
+      // cron, malgré R19 vert. Fix : appel inconditionnel + generateCaption gère
+      // elle-même les fallbacks (banque → IA → template).
+      console.log('[caption] Resolution de ' + futurePlan.length + ' caption(s) — banque puis IA puis template, batches de ' + CAPTION_BATCH + '...');
+      for (var ci2 = 0; ci2 < futurePlan.length; ci2 += CAPTION_BATCH) {
+        const batch = futurePlan.slice(ci2, ci2 + CAPTION_BATCH);
+        await Promise.all(
+          batch.map(function(item) {
+            return generateCaption(item.file.id, item.type, item.uname, captionCfg, item.file.name, item.acc)
+              .then(function(cap) { item.caption = cap; });
+          })
+        );
       }
+      console.log('[caption] Toutes les captions resolues.');
     }
 
     // ── PHASE 3 : Scheduler sur OneUp + déplacer les fichiers Drive ──────────
