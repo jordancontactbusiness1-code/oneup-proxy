@@ -368,57 +368,33 @@ async function callAnthropic(uname, template, fileName) {
 async function generateCaption(fileId, type, uname, captionCfg, fileName, accountRecord) {
   const template = (captionCfg && captionCfg.template) || '';
 
-  // Stories : template uniquement (pas d'IA, pas de banque — peu visible sur stories)
+  // Stories : template uniquement (peu visible sur les stories, design choisi).
   if (type === 'stories') return template;
 
-  // ── R17 / Phase 7+ — BANQUE EN PRIORITÉ AVANT IA (2026-05-04) ──
-  // Si le compte a un modelName (ou agency dérivé) ET que la banque
-  // zenty/caption_bank/{modelKey} existe, on pioche dedans via shuffle-bag.
-  // Garanties identiques au frontend (js/captions/bank.js) : zéro répétition
-  // dans un cycle complet de N captions, par compte. Pas d'override 'ai' ici
-  // (Jordan peut le forcer via le frontend en local, mais le cron tente
-  // toujours la banque d'abord — c'est le comportement scaling voulu).
-  try {
-    const modelName = captionBank.deriveModelName(accountRecord);
-    if (modelName) {
-      const fromBank = await captionBank.pickFromBank(uname, modelName);
-      if (fromBank) {
-        console.log('[caption] Bank pick @' + uname + ' [' + modelName + ']: "' + fromBank.substring(0, 50) + '"');
-        return fromBank;
-      }
-    }
-  } catch (e) {
-    console.error('[caption] Bank error @' + uname + ':', e.message);
-    // continue → fallback IA / template
+  // ── R23 (2026-05-07) — REELS/CAROUSEL = BANQUE OBLIGATOIRE ──
+  // Plus de fallback IA, plus de fallback template. Chaque Reel/Carousel
+  // DOIT venir de la banque caption_bank/{modelKey} Firebase.
+  //
+  // Pourquoi : Jordan a confirmé 2026-05-07 — pool curé Tina FR, zéro
+  // hallucination, zéro coût Anthropic, CTA bio garanti. La banque ne doit
+  // JAMAIS être indisponible : si elle l'est, on lève une erreur explicite
+  // que la phase 2c catch + skip ce post (mieux 1 reel non programmé que
+  // 1 caption hors-pool).
+  //
+  // Garde-fous :
+  //   - Pre-check au handler : si la banque est vide/manquante, abort tout.
+  //   - R23 dans regression-check.js : interdit fallback IA/template ici.
+  //   - R21 runtime : alerte si <50% in_bank sur les 30 derniers posts.
+  const modelName = captionBank.deriveModelName(accountRecord);
+  if (!modelName) {
+    throw new Error('No modelName derivable for @' + uname + ' (acc.modelName absent + agency!=FR/US)');
   }
-
-  // IA désactivée ou pas de clé → template
-  if (!captionCfg || !captionCfg.enabled || !ANTHROPIC_KEY) return template;
-
-  // Cache Firebase — clé par (fileId, uname) pour éviter caption identique
-  // si le même reel passe sur 2 comptes (= flag Instagram garanti).
-  const sanitizedFileId = fileId.replace(/[^a-zA-Z0-9]/g, '_');
-  const sanitizedUname  = (uname || 'unknown').replace(/[^a-zA-Z0-9]/g, '_');
-  const cacheKey = 'zenty/captions_cache/' + sanitizedFileId + '__' + sanitizedUname;
-  try {
-    const cached = await fbGet(cacheKey);
-    if (cached && cached.text) {
-      console.log('[caption] Cache hit — ' + fileId.substring(0, 12) + '... @' + uname);
-      return cached.text;
-    }
-  } catch (e) { /* ignore erreur cache */ }
-
-  // Appel Anthropic
-  try {
-    const caption = await callAnthropic(uname, template, fileName);
-    // Écriture cache en arrière-plan (silencieux si échec)
-    fbPut(cacheKey, { text: caption, generatedAt: Date.now(), account: uname }).catch(function() {});
-    console.log('[caption] Generated @' + uname + ': "' + caption.substring(0, 50) + '"');
-    return caption;
-  } catch (e) {
-    console.error('[caption] Anthropic error @' + uname + ':', e.message);
-    return template; // fallback garanti
+  const fromBank = await captionBank.pickFromBank(uname, modelName);
+  if (!fromBank) {
+    throw new Error('Bank pickFromBank returned null for @' + uname + ' [' + modelName + '] — banque vide ou Firebase indisponible');
   }
+  console.log('[caption] Bank pick @' + uname + ' [' + modelName + ']: "' + fromBank.substring(0, 50) + '"');
+  return fromBank;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -578,6 +554,52 @@ module.exports = async function handler(req, res) {
     const captionMode    = captionCfg.enabled ? '✨ Claude IA' : '📝 Template';
 
     console.log('[cron v3] Caption mode: ' + captionMode);
+
+    // ── PRE-CHECK BANQUE OBLIGATOIRE (R23, 2026-05-07) ──────────────────────
+    // La banque ne doit JAMAIS être indisponible. On charge les banques utilisées
+    // par les comptes actifs avant Phase 1. Si la moindre est vide ou manquante,
+    // ABORT tout le run avec alerte Telegram critique. Mieux 0 reel programmé
+    // (Jordan voit l'alerte, fixe la banque, retrigger) que 12 reels postés
+    // avec template ou IA hallucinée.
+    const requiredModels = new Set();
+    Object.keys(accounts).forEach(function(snid) {
+      const a = accounts[snid];
+      if (!a || a.paused === true) return;
+      const m = captionBank.deriveModelName(a);
+      if (m) requiredModels.add(m);
+    });
+    const bankProblems = [];
+    for (const modelName of requiredModels) {
+      const modelKey = captionBank.modelKeyOf(modelName);
+      const banque = await fbGet('zenty/caption_bank/' + modelKey).catch(function() { return null; });
+      const captions = (banque && Array.isArray(banque.captions)) ? banque.captions : [];
+      if (captions.length < 10) {
+        bankProblems.push({ model: modelName, key: modelKey, count: captions.length });
+      }
+    }
+    if (bankProblems.length > 0) {
+      const msg = [
+        '🚨 *BANQUE CAPTIONS INDISPONIBLE — cron AVORTE*',
+        '',
+        'Modèles avec banque vide ou < 10 captions :'
+      ];
+      bankProblems.forEach(function(p) {
+        msg.push('  • ' + p.model + ' (' + p.key + ') : ' + p.count + ' caption(s)');
+      });
+      msg.push('');
+      msg.push('→ Re-seed via dashboard Settings → 📝 Banque captions');
+      msg.push('→ Aucun Reel/Carousel programmé tant que la banque n\'est pas restaurée.');
+      await sendTelegram(msg.join('\n'));
+      console.error('[cron v3] BANQUE INDISPONIBLE — ABORT', JSON.stringify(bankProblems));
+      res.status(503).json({
+        ok: false,
+        aborted: true,
+        reason: 'caption_bank_unavailable',
+        problems: bankProblems
+      });
+      return;
+    }
+    console.log('[cron v3] Banque OK pour ' + requiredModels.size + ' modèle(s) : ' + Array.from(requiredModels).join(', '));
 
     // 2. OAuth Drive + prefetch OneUp + registry typeMap en parallèle (une seule fois pour tout le run)
     // En mode CHECKER : aussi fetch published pour exclure ce qui a déjà été publié
@@ -875,32 +897,33 @@ module.exports = async function handler(req, res) {
     }
 
     // ── PHASE 2c : Générer les captions UNIQUEMENT pour les posts gardés ───────
-    // Batches de 15 pour respecter les rate limits Anthropic (50 RPM Haiku).
-    // Stories → template. Reels/Carousel → IA si enabled.
-    // Cache Firebase évite les regénérations pour les mêmes fichiers.
+    // Reels/Carousel = banque OBLIGATOIRE (R23, 2026-05-07).
+    // Stories = template par design (peu visible, generateCaption gère).
+    // Si la banque échoue pour un item, on catch l'erreur LOCALEMENT (pas
+    // Promise.all rejection globale) et on marque skipBankFail=true. La phase 3
+    // skip ces items et compte les fails. À la fin, alerte Telegram si >0.
     // ─────────────────────────────────────────────────────────────────────────
-    const CAPTION_BATCH = 15; // max appels Anthropic simultanés
+    const CAPTION_BATCH = 15;
     const futurePlan    = plan.filter(function(i){ return !i.skipPast; });
+    var bankFailedTotal = 0;
     if (futurePlan.length > 0) {
-      // R19/R21 (2026-05-07) : TOUJOURS appeler generateCaption().
-      // generateCaption() tente la banque AVANT l'IA AVANT le template — c'est le
-      // seul chemin qui consulte la banque captions Firebase.
-      // Bug détecté en prod : sans ANTHROPIC_API_KEY dans /opt/zenty-cron/.env, le
-      // code skippait generateCaption() et tombait direct sur le template, ce qui
-      // faisait que la banque (70 captions Tina FR) n'était JAMAIS pioché côté
-      // cron, malgré R19 vert. Fix : appel inconditionnel + generateCaption gère
-      // elle-même les fallbacks (banque → IA → template).
-      console.log('[caption] Resolution de ' + futurePlan.length + ' caption(s) — banque puis IA puis template, batches de ' + CAPTION_BATCH + '...');
+      console.log('[caption] Resolution de ' + futurePlan.length + ' caption(s) — banque obligatoire, batches de ' + CAPTION_BATCH + '...');
       for (var ci2 = 0; ci2 < futurePlan.length; ci2 += CAPTION_BATCH) {
         const batch = futurePlan.slice(ci2, ci2 + CAPTION_BATCH);
         await Promise.all(
           batch.map(function(item) {
             return generateCaption(item.file.id, item.type, item.uname, captionCfg, item.file.name, item.acc)
-              .then(function(cap) { item.caption = cap; });
+              .then(function(cap) { item.caption = cap; })
+              .catch(function(err) {
+                console.error('[caption] FAIL @' + item.uname + ' ' + item.type + ' file=' + (item.file && item.file.name) + ': ' + err.message);
+                item.skipBankFail = true;
+                item.captionError = err.message;
+                bankFailedTotal++;
+              });
           })
         );
       }
-      console.log('[caption] Toutes les captions resolues.');
+      console.log('[caption] Resolution terminee — ' + (futurePlan.length - bankFailedTotal) + '/' + futurePlan.length + ' OK, ' + bankFailedTotal + ' bank-fail.');
     }
 
     // ── PHASE 3 : Scheduler sur OneUp + déplacer les fichiers Drive ──────────
@@ -920,6 +943,12 @@ module.exports = async function handler(req, res) {
           if (item.skipPast) {
             pastSkippedTotal++;
             accountResults[item.snId].errors.push(item.type + ': slot passé (' + item.slot + ') — skip anti-rafale');
+            return;
+          }
+          // R23 : skip les items dont la banque n'a pas pu fournir une caption.
+          // Mieux 1 reel non programmé qu'un reel posté avec template ou IA hallucinée.
+          if (item.skipBankFail) {
+            accountResults[item.snId].errors.push(item.type + ': banque indisponible (' + (item.captionError || 'unknown') + ')');
             return;
           }
           const result = await schedulePost(
@@ -1019,6 +1048,27 @@ module.exports = async function handler(req, res) {
           const msg = tg.formatLowDriveAlert(lowDriveAccounts);
           if (msg) await sendTelegram(msg);
         } catch (e) { console.warn('[telegram-format] not available:', e.message); }
+      }
+
+      // 2b. Banque captions en échec sur des items individuels (R23) — alerte
+      // immédiate pour Jordan : la banque devrait JAMAIS retourner null pour un
+      // compte avec une banque saine. Si on arrive ici, soit deriveModelName a
+      // raté pour un compte spécifique (agency != FR/US et pas de modelName),
+      // soit la banque a été wipe entre le pre-check et le pick.
+      if (bankFailedTotal > 0) {
+        const bankFails = futurePlan.filter(function(i) { return i.skipBankFail; }).slice(0, 8);
+        const lines = [
+          '🚨 *Banque captions échec sur ' + bankFailedTotal + ' post(s)*',
+          '',
+          'Reels skippés (mieux que template/IA) :'
+        ];
+        bankFails.forEach(function(it) {
+          lines.push('  • @' + it.uname + ' ' + it.type + ' : ' + (it.captionError || 'unknown'));
+        });
+        lines.push('');
+        lines.push('→ Vérifier `zenty/caption_bank/{tina_fr|tina_us}` Firebase');
+        lines.push('→ Vérifier `agency` ou `modelName` sur les comptes Firebase');
+        await sendTelegram(lines.join('\n'));
       }
 
       // 3. Pas de message "tout va bien" en mode daily — le digest matin/soir s'en charge.
